@@ -7,6 +7,7 @@ import {
   DEFAULT_OUTPUT_DIR,
   STARTER_DESIGN_MD,
   initProject,
+  makeUpMarkdown,
   renderProject,
 } from "../src/index.js";
 
@@ -111,6 +112,7 @@ describe("renderProject", () => {
     const outputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
 
     expect(first.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/README.html",
       ".make-up-markdown/agents.html",
@@ -118,6 +120,7 @@ describe("renderProject", () => {
       ".make-up-markdown/index.html",
     ]);
     expect(second.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/README.html",
       ".make-up-markdown/agents.html",
@@ -127,30 +130,44 @@ describe("renderProject", () => {
     expect(html).toBe(htmlAgain);
     expect(index).toBe(indexAgain);
     expect(await readFile(path.join(cwd, "README.md"), "utf8")).toBe(before);
-    expect(html).toContain('<a href="docs/guide.md">guide</a>');
-    expect(html).toContain('<img src="https://example.com/image.png" alt="remote">');
-    expect(html).toContain("<style>");
-    expect(html).not.toContain('rel="stylesheet"');
-    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "README.html", "agents.html", "docs", "index.html"]);
-    expect(index).toContain("<h1>Documentation Index</h1>");
+    expect(html).toContain('<link rel="stylesheet" href="style.css">');
+    expect(html).toContain('<a href="docs/guide.md" class="mum-link">guide</a>');
+    expect(html).toContain('<img src="https://example.com/image.png" alt="remote" class="mum-image">');
+    expect(html).not.toContain("<style>");
+    expect(index).toContain('<link rel="stylesheet" href="style.css">');
+    expect(index).not.toContain("<style>");
+    expect(outputNames.sort()).toEqual([
+      "DESIGN-MD.html",
+      "README.html",
+      "agents.html",
+      "docs",
+      "index.html",
+      "style.css",
+    ]);
+    const stylesheet = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "style.css"), "utf8");
+    expect(stylesheet).toContain(".mum-heading");
+    expect(stylesheet).toContain(".mum-h1");
+    expect(stylesheet).toContain(".mum-link");
+    expect(stylesheet).toContain(".mum-task-list");
+    expect(index).toContain('<h1 class="mum-heading mum-h1">Documentation Index</h1>');
     expect(index).toContain('<nav aria-label="Generated documentation">');
-    expect(index).toContain('<a href="DESIGN-MD.html">DESIGN-MD.html</a>');
-    expect(index).toContain('<a href="README.html">README.html</a>');
-    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
+    expect(index).toContain('<a class="mum-link" href="DESIGN-MD.html">DESIGN-MD.html</a>');
+    expect(index).toContain('<a class="mum-link" href="README.html">README.html</a>');
+    expect(index).toContain('<a class="mum-link" href="docs/guide.html">docs/guide.html</a>');
     expect(index).not.toContain('<a href="index.html">index.html</a>');
     expect(index).not.toContain("stale.html");
-    expect(index.indexOf("<h2 id=\"section-1\">Root</h2>")).toBeLessThan(
-      index.indexOf("<h2 id=\"section-2\">docs</h2>"),
+    expect(index.indexOf('<h2 class="mum-heading mum-h2" id="section-1">Root</h2>')).toBeLessThan(
+      index.indexOf('<h2 class="mum-heading mum-h2" id="section-2">docs</h2>'),
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, DEFAULT_DESIGN_FILE.replace(".md", ".html")), "utf8")).resolves.toContain(
-      "<h1>Make Up Markdown Starter</h1>",
+      '<h1 class="mum-heading mum-h1">Make Up Markdown Starter</h1>',
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "agents.html"), "utf8")).resolves.toContain(
-      "<h1>Agents</h1>",
+      '<h1 class="mum-heading mum-h1">Agents</h1>',
     );
-    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
-      "<h1>Guide</h1>",
-    );
+    const nestedHtml = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8");
+    expect(nestedHtml).toContain('<link rel="stylesheet" href="../style.css">');
+    expect(nestedHtml).toContain('<h1 class="mum-heading mum-h1">Guide</h1>');
 
     await writeFile(path.join(cwd, "README.md"), "# Project\n\nUpdated content.\n", "utf8");
     await renderProject({ cwd });
@@ -179,6 +196,7 @@ describe("renderProject", () => {
     const result = await renderProject({ cwd });
 
     expect(result.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/a.html",
       ".make-up-markdown/b.html",
@@ -186,15 +204,19 @@ describe("renderProject", () => {
       ".make-up-markdown/index.html",
     ]);
     const index = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
-    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "a.html"), "utf8")).resolves.toContain("<h1>A</h1>");
-    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "b.html"), "utf8")).resolves.toContain("<h1>B</h1>");
-    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
-      "<h1>Guide</h1>",
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "a.html"), "utf8")).resolves.toContain(
+      '<h1 class="mum-heading mum-h1">A</h1>',
     );
-    expect(index).toContain('<a href="DESIGN-MD.html">DESIGN-MD.html</a>');
-    expect(index).toContain('<a href="a.html">a.html</a>');
-    expect(index).toContain('<a href="b.html">b.html</a>');
-    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "b.html"), "utf8")).resolves.toContain(
+      '<h1 class="mum-heading mum-h1">B</h1>',
+    );
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
+      '<h1 class="mum-heading mum-h1">Guide</h1>',
+    );
+    expect(index).toContain('<a class="mum-link" href="DESIGN-MD.html">DESIGN-MD.html</a>');
+    expect(index).toContain('<a class="mum-link" href="a.html">a.html</a>');
+    expect(index).toContain('<a class="mum-link" href="b.html">b.html</a>');
+    expect(index).toContain('<a class="mum-link" href="docs/guide.html">docs/guide.html</a>');
     expect(index).not.toContain(".hidden.html");
     expect(index).not.toContain("dependency.html");
     expect(index).not.toContain("generated.html");
@@ -214,11 +236,12 @@ describe("renderProject", () => {
     const docsOutputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs"));
 
     expect(result.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/a.html",
       ".make-up-markdown/index.html",
     ]);
-    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "a.html", "docs", "index.html"]);
+    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "a.html", "docs", "index.html", "style.css"]);
     expect(docsOutputNames).toEqual([]);
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8")).resolves.not.toContain(
       "docs/b.html",
@@ -238,22 +261,23 @@ describe("renderProject", () => {
     const result = await renderProject({ cwd, inputs: ["docs/guide.md", ".hidden.md"] });
 
     expect(result.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/docs/guide.html",
       ".make-up-markdown/.hidden.html",
       ".make-up-markdown/index.html",
     ]);
     const index = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
-      "<h1>Guide</h1>",
+      '<h1 class="mum-heading mum-h1">Guide</h1>',
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, ".hidden.html"), "utf8")).resolves.toContain(
-      "<h1>Hidden</h1>",
+      '<h1 class="mum-heading mum-h1">Hidden</h1>',
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "stale.html"), "utf8")).resolves.toBe("stale");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8")).rejects.toThrow();
-    expect(index).toContain('<a href=".hidden.html">.hidden.html</a>');
-    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
-    expect(index).toContain('<a href="stale.html">stale.html</a>');
+    expect(index).toContain('<a class="mum-link" href=".hidden.html">.hidden.html</a>');
+    expect(index).toContain('<a class="mum-link" href="docs/guide.html">docs/guide.html</a>');
+    expect(index).toContain('<a class="mum-link" href="stale.html">stale.html</a>');
     expect(index).not.toContain("README.html");
   });
 
@@ -287,6 +311,7 @@ describe("renderProject", () => {
     const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8");
 
     expect(result.generated).toEqual([
+      ".make-up-markdown/style.css",
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/docs/guide.html",
       ".make-up-markdown/index.html",
@@ -294,6 +319,57 @@ describe("renderProject", () => {
     expect(result.warnings).toEqual([]);
     expect(html).toContain('src="data:image/png;base64,');
     expect(html).not.toContain("assets/pixel.png");
+  });
+
+  it("renders Markdown elements with semantic mum classes and GFM behavior", () => {
+    const html = makeUpMarkdown(`# Heading
+
+## Subheading
+
+### Detail
+
+Paragraph with [link](https://example.com), ![alt text](image.png), \`inline\`, ~~old~~, and https://example.org.
+
+- one
+- [x] done
+- [ ] todo
+
+1. first
+
+> quote
+
+\`\`\`ts
+const value = 1;
+\`\`\`
+
+| Name | Value |
+| --- | --- |
+| A | B |
+
+---
+`);
+
+    expect(html).toContain('<h1 class="mum-heading mum-h1">Heading</h1>');
+    expect(html).toContain('<h2 class="mum-heading mum-h2">Subheading</h2>');
+    expect(html).toContain('<h3 class="mum-heading mum-h3">Detail</h3>');
+    expect(html).toContain('<p class="mum-paragraph">Paragraph with ');
+    expect(html).toContain('<a href="https://example.com" class="mum-link">link</a>');
+    expect(html).toContain('<img src="image.png" alt="alt text" class="mum-image">');
+    expect(html).toContain('<code class="mum-code mum-code-inline">inline</code>');
+    expect(html).toContain('<s class="mum-strikethrough">old</s>');
+    expect(html).toContain('<a href="https://example.org" class="mum-link">https://example.org</a>');
+    expect(html).toContain('<ul class="contains-task-list mum-list mum-ul mum-task-list">');
+    expect(html).toContain('<li class="mum-list-item">one</li>');
+    expect(html).toContain('<li class="task-list-item mum-list-item mum-task-list-item">');
+    expect(html).toContain('class="task-list-item-checkbox mum-task-list-checkbox" checked="" disabled="" type="checkbox"');
+    expect(html).toContain('class="task-list-item-checkbox mum-task-list-checkbox" disabled="" type="checkbox"');
+    expect(html).toContain('<ol class="mum-list mum-ol">');
+    expect(html).toContain('<blockquote class="mum-blockquote">');
+    expect(html).toContain('<pre class="mum-code-block"><code class="mum-code mum-code-block-code language-ts">');
+    expect(html).toContain('<table class="mum-table">');
+    expect(html).toContain('<th class="mum-table-cell mum-table-header">Name</th>');
+    expect(html).toContain('<td class="mum-table-cell">A</td>');
+    expect(html).toContain('<hr class="mum-hr">');
   });
 
   it("warns when supported local images cannot be embedded and unsupported images are referenced", async () => {

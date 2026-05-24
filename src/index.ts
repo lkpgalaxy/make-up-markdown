@@ -1,5 +1,6 @@
 import matter from "gray-matter";
 import MarkdownIt from "markdown-it";
+import markdownItTaskLists from "markdown-it-task-lists";
 import { constants as fsConstants } from "node:fs";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -273,6 +274,9 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   }
 
   await mkdir(outputDir, { recursive: true });
+  const stylesheetPath = await writeStylesheet(outputDir, design);
+  result.generated.push(relativePath(cwd, stylesheetPath));
+
   if (!hasExplicitInputs) {
     await removeStaleHtml(outputDir, inputs.map((input) => outputFileName(input)));
   }
@@ -280,14 +284,21 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   for (const input of inputs) {
     const inputPath = path.join(cwd, input);
     const markdown = await readFile(inputPath, "utf8");
-    const html = await renderMarkdownFile(markdown, inputPath, input, design, result.warnings);
-    const outputPath = path.join(outputDir, outputFileName(input));
+    const outputName = outputFileName(input);
+    const html = await renderMarkdownFile(
+      markdown,
+      inputPath,
+      input,
+      stylesheetHrefForOutput(outputName),
+      result.warnings,
+    );
+    const outputPath = path.join(outputDir, outputName);
     await mkdir(path.dirname(outputPath), { recursive: true });
     await writeFile(outputPath, html, "utf8");
     result.generated.push(relativePath(cwd, outputPath));
   }
 
-  const indexPath = await writeDocumentationIndex(outputDir, design);
+  const indexPath = await writeDocumentationIndex(outputDir);
   result.generated.push(relativePath(cwd, indexPath));
 
   return result;
@@ -439,7 +450,7 @@ async function renderMarkdownFile(
   markdown: string,
   inputPath: string,
   inputName: string,
-  design: DesignTokens,
+  stylesheetHref: string,
   warnings: string[],
 ): Promise<string> {
   const md = createMarkdownIt();
@@ -447,15 +458,78 @@ async function renderMarkdownFile(
   await embedLocalImages(tokens, path.dirname(inputPath), inputName, warnings);
   const body = md.renderer.render(tokens, md.options, {});
   const title = firstHeading(tokens) ?? inputName.replace(/\.md$/i, "");
-  return renderDocument(title, body, design);
+  return renderDocument(title, body, stylesheetHref);
 }
 
 function createMarkdownIt(): MarkdownIt {
-  return new MarkdownIt({
+  const md = new MarkdownIt({
     html: false,
-    linkify: false,
+    linkify: true,
     typographer: false,
+  }).use(markdownItTaskLists);
+
+  addClassRule(md, "heading_open", (token) => {
+    const level = token.tag.replace(/^h/i, "");
+    return `mum-heading mum-h${level}`;
   });
+  addClassRule(md, "paragraph_open", "mum-paragraph");
+  addClassRule(md, "link_open", "mum-link");
+  addClassRule(md, "bullet_list_open", (token) =>
+    hasClass(token, "contains-task-list") ? "mum-list mum-ul mum-task-list" : "mum-list mum-ul",
+  );
+  addClassRule(md, "ordered_list_open", (token) =>
+    hasClass(token, "contains-task-list") ? "mum-list mum-ol mum-task-list" : "mum-list mum-ol",
+  );
+  addClassRule(md, "list_item_open", (token) =>
+    hasClass(token, "task-list-item") ? "mum-list-item mum-task-list-item" : "mum-list-item",
+  );
+  addClassRule(md, "blockquote_open", "mum-blockquote");
+  addClassRule(md, "table_open", "mum-table");
+  addClassRule(md, "thead_open", "mum-table-head");
+  addClassRule(md, "tbody_open", "mum-table-body");
+  addClassRule(md, "tr_open", "mum-table-row");
+  addClassRule(md, "th_open", "mum-table-cell mum-table-header");
+  addClassRule(md, "td_open", "mum-table-cell");
+  addClassRule(md, "hr", "mum-hr");
+  addClassRule(md, "s_open", "mum-strikethrough");
+
+  md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
+    const token = tokens[idx];
+    const altIndex = token.attrIndex("alt");
+    if (altIndex >= 0 && token.attrs) {
+      token.attrs[altIndex][1] = renderer.renderInlineAsText(token.children ?? [], options, env);
+    }
+    addClass(token, "mum-image");
+    return renderer.renderToken(tokens, idx, options);
+  };
+
+  md.renderer.rules.code_inline = (tokens, idx) => {
+    return `<code class="mum-code mum-code-inline">${escapeHtml(tokens[idx].content)}</code>`;
+  };
+
+  md.renderer.rules.code_block = (tokens, idx) => {
+    return `<pre class="mum-code-block"><code class="mum-code mum-code-block-code">${escapeHtml(tokens[idx].content)}</code></pre>\n`;
+  };
+
+  md.renderer.rules.fence = (tokens, idx) => {
+    const token = tokens[idx];
+    const langName = token.info.trim().split(/\s+/)[0] ?? "";
+    const languageClass = langName ? ` language-${escapeHtmlAttribute(langName)}` : "";
+    return `<pre class="mum-code-block"><code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
+  };
+
+  md.renderer.rules.html_inline = (tokens, idx) => {
+    const content = tokens[idx].content;
+    if (content.startsWith('<input class="task-list-item-checkbox"')) {
+      return content.replace(
+        'class="task-list-item-checkbox"',
+        'class="task-list-item-checkbox mum-task-list-checkbox"',
+      );
+    }
+    return content;
+  };
+
+  return md;
 }
 
 async function embedLocalImages(
@@ -506,7 +580,7 @@ async function embedImageToken(
   }
 }
 
-function renderDocument(title: string, body: string, design: DesignTokens): string {
+function renderDocument(title: string, body: string, stylesheetHref: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -514,22 +588,26 @@ function renderDocument(title: string, body: string, design: DesignTokens): stri
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="make-up-markdown 0.1.0">
 <title>${escapeHtml(title)}</title>
-<style>
-${renderCss(design)}
-</style>
+<link rel="stylesheet" href="${escapeHtmlAttribute(stylesheetHref)}">
 </head>
 <body>
-<main class="document">
+<main class="mum-document">
 ${body}</main>
 </body>
 </html>
 `;
 }
 
-async function writeDocumentationIndex(outputDir: string, design: DesignTokens): Promise<string> {
+async function writeStylesheet(outputDir: string, design: DesignTokens): Promise<string> {
+  const stylesheetPath = path.join(outputDir, "style.css");
+  await writeFile(stylesheetPath, renderCss(design), "utf8");
+  return stylesheetPath;
+}
+
+async function writeDocumentationIndex(outputDir: string): Promise<string> {
   const indexPath = path.join(outputDir, "index.html");
   const pages = await discoverGeneratedHtmlPages(outputDir);
-  const html = renderIndexDocument(pages, design);
+  const html = renderIndexDocument(pages);
   await writeFile(indexPath, html, "utf8");
   return indexPath;
 }
@@ -560,7 +638,7 @@ async function discoverGeneratedHtmlPages(outputDir: string): Promise<string[]> 
   return pages.sort(compareStable);
 }
 
-function renderIndexDocument(pages: string[], design: DesignTokens): string {
+function renderIndexDocument(pages: string[]): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -568,13 +646,11 @@ function renderIndexDocument(pages: string[], design: DesignTokens): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="generator" content="make-up-markdown 0.1.0">
 <title>Documentation Index</title>
-<style>
-${renderCss(design)}
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main class="document">
-<h1>Documentation Index</h1>
+<main class="mum-document">
+<h1 class="mum-heading mum-h1">Documentation Index</h1>
 <nav aria-label="Generated documentation">
 ${renderIndexSections(pages)}
 </nav>
@@ -586,7 +662,7 @@ ${renderIndexSections(pages)}
 
 function renderIndexSections(pages: string[]): string {
   if (pages.length === 0) {
-    return "<p>No generated HTML pages were found.</p>";
+    return '<p class="mum-paragraph">No generated HTML pages were found.</p>';
   }
 
   return groupIndexPages(pages)
@@ -594,12 +670,15 @@ function renderIndexSections(pages: string[]): string {
       const headingId = `section-${index + 1}`;
       const title = group.folder === "" ? "Root" : group.folder;
       const links = group.pages
-        .map((page) => `  <li><a href="${escapeHtmlAttribute(page)}">${escapeHtml(page)}</a></li>`)
+        .map(
+          (page) =>
+            `  <li class="mum-list-item"><a class="mum-link" href="${escapeHtmlAttribute(page)}">${escapeHtml(page)}</a></li>`,
+        )
         .join("\n");
 
       return `<section aria-labelledby="${headingId}">
-<h2 id="${headingId}">${escapeHtml(title)}</h2>
-<ul>
+<h2 class="mum-heading mum-h2" id="${headingId}">${escapeHtml(title)}</h2>
+<ul class="mum-list mum-ul">
 ${links}
 </ul>
 </section>`;
@@ -674,7 +753,7 @@ body {
   line-height: var(--mum-body-line-height);
 }
 
-.document {
+.mum-document {
   width: min(100% - 32px, 920px);
   margin: var(--mum-space-xl) auto;
   padding: var(--mum-space-xl);
@@ -683,112 +762,142 @@ body {
   border-radius: var(--mum-radius-lg);
 }
 
-.document > :first-child {
+.mum-document > :first-child {
   margin-top: 0;
 }
 
-.document > :last-child {
+.mum-document > :last-child {
   margin-bottom: 0;
 }
 
-h1,
-h2,
-h3,
-h4,
-h5,
-h6 {
+.mum-heading {
   color: var(--mum-text);
   font-weight: var(--mum-heading-weight);
   line-height: 1.2;
+  letter-spacing: 0;
 }
 
-h1 {
+.mum-h1 {
   font-size: var(--mum-h1-size);
   margin: 0 0 var(--mum-space-lg);
 }
 
-h2 {
+.mum-h2 {
   font-size: var(--mum-h2-size);
   margin: var(--mum-space-xl) 0 var(--mum-space-md);
 }
 
-h3 {
+.mum-h3 {
   font-size: var(--mum-h3-size);
   margin: var(--mum-space-lg) 0 var(--mum-space-sm);
 }
 
-p,
-ul,
-ol,
-blockquote,
-pre,
-table {
+.mum-h4,
+.mum-h5,
+.mum-h6 {
+  font-size: var(--mum-h3-size);
+  margin: var(--mum-space-lg) 0 var(--mum-space-sm);
+}
+
+.mum-paragraph,
+.mum-list,
+.mum-blockquote,
+.mum-code-block,
+.mum-table {
   margin: 0 0 var(--mum-space-md);
 }
 
-a {
+.mum-link {
   color: var(--mum-primary);
   text-decoration-thickness: 0.08em;
   text-underline-offset: 0.18em;
 }
 
-code,
-pre {
+.mum-code,
+.mum-code-block {
   font-family: var(--mum-mono-font);
 }
 
-code {
+.mum-code-inline {
   padding: 0.15em 0.35em;
   background: var(--mum-code-background);
   border-radius: var(--mum-radius-sm);
 }
 
-pre {
+.mum-code-block {
   overflow-x: auto;
   padding: var(--mum-space-md);
   background: var(--mum-code-background);
   border-radius: var(--mum-radius-md);
 }
 
-pre code {
+.mum-code-block-code {
   padding: 0;
   background: transparent;
 }
 
-blockquote {
+.mum-blockquote {
   padding-left: var(--mum-space-md);
   color: var(--mum-muted);
   border-left: 4px solid var(--mum-border);
 }
 
-table {
+.mum-list {
+  padding-left: var(--mum-space-lg);
+}
+
+.mum-task-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.mum-task-list-item {
+  display: flex;
+  gap: var(--mum-space-sm);
+  align-items: baseline;
+}
+
+.mum-task-list-checkbox {
+  flex: 0 0 auto;
+  transform: translateY(0.12em);
+}
+
+.mum-table {
   width: 100%;
   border-collapse: collapse;
   display: block;
   overflow-x: auto;
 }
 
-th,
-td {
+.mum-table-cell {
   padding: var(--mum-space-sm) var(--mum-space-md);
   border: 1px solid var(--mum-border);
   text-align: left;
   vertical-align: top;
 }
 
-img {
+.mum-table-header {
+  font-weight: var(--mum-heading-weight);
+  background: var(--mum-code-background);
+}
+
+.mum-image {
   max-width: 100%;
   height: auto;
 }
 
-hr {
+.mum-hr {
   border: 0;
   border-top: 1px solid var(--mum-border);
   margin: var(--mum-space-xl) 0;
 }
 
+.mum-strikethrough {
+  text-decoration: line-through;
+}
+
 @media (max-width: 640px) {
-  .document {
+  .mum-document {
     width: 100%;
     margin: 0;
     padding: var(--mum-space-lg);
@@ -797,6 +906,25 @@ hr {
     border-radius: 0;
   }
 }`;
+}
+
+function addClassRule(md: MarkdownIt, tokenType: string, className: string | ((token: MarkdownToken) => string)): void {
+  const defaultRender =
+    md.renderer.rules[tokenType] ??
+    ((tokens, idx, options, _env, renderer) => renderer.renderToken(tokens, idx, options));
+
+  md.renderer.rules[tokenType] = (tokens, idx, options, env, renderer) => {
+    addClass(tokens[idx], typeof className === "function" ? className(tokens[idx]) : className);
+    return defaultRender(tokens, idx, options, env, renderer);
+  };
+}
+
+function addClass(token: MarkdownToken, className: string): void {
+  token.attrJoin("class", className);
+}
+
+function hasClass(token: MarkdownToken, className: string): boolean {
+  return (token.attrGet("class") ?? "").split(/\s+/).includes(className);
 }
 
 async function ensureOutputIsIgnored(gitignorePath: string): Promise<"created" | "updated" | "reused"> {
@@ -858,6 +986,16 @@ async function removeStaleHtml(outputDir: string, expectedNames: string[]): Prom
 
 function outputFileName(inputName: string): string {
   return inputName.replace(/\.md$/i, ".html");
+}
+
+function stylesheetHrefForOutput(outputName: string): string {
+  const outputDir = path.posix.dirname(outputName);
+  if (outputDir === ".") {
+    return "style.css";
+  }
+
+  const depth = outputDir.split("/").filter(Boolean).length;
+  return `${"../".repeat(depth)}style.css`;
 }
 
 function firstHeading(tokens: MarkdownToken[]): string | undefined {
