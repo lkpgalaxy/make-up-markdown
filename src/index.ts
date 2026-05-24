@@ -2,7 +2,8 @@ import matter from "gray-matter";
 import MarkdownIt from "markdown-it";
 import markdownItTaskLists from "markdown-it-task-lists";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 
 export const DEFAULT_OUTPUT_DIR = ".make-up-markdown";
@@ -60,6 +61,26 @@ interface DesignTokens {
 }
 
 type MarkdownToken = ReturnType<MarkdownIt["parse"]>[number];
+
+interface RenderedMarkdownFile {
+  html: string;
+  hasMermaid: boolean;
+}
+
+const require = createRequire(import.meta.url);
+
+const MERMAID_BUNDLE_FILE = "mermaid.min.js";
+const MERMAID_INIT_FILE = "mermaid-init.js";
+const MERMAID_ASSET_FILES = [MERMAID_BUNDLE_FILE, MERMAID_INIT_FILE];
+const MERMAID_INIT_JS = `(() => {
+  if (!globalThis.mermaid) {
+    return;
+  }
+
+  globalThis.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
+  globalThis.mermaid.run({ querySelector: ".mum-mermaid", suppressErrors: true });
+})();
+`;
 
 const BUILT_IN_DESIGN: DesignTokens = {
   colors: {
@@ -278,21 +299,28 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   const stylesheetPath = await writeStylesheet(outputDir, design);
   result.generated.push(relativePath(cwd, stylesheetPath));
 
-  if (!hasExplicitInputs) {
-    await removeStaleHtml(outputDir, inputs.map((input) => outputFileName(input)));
-  }
+  const renderedFiles: Array<{ outputName: string; html: string; hasMermaid: boolean }> = [];
 
   for (const input of inputs) {
     const inputPath = path.join(cwd, input);
     const markdown = await readFile(inputPath, "utf8");
     const outputName = outputFileName(input);
-    const html = await renderMarkdownFile(
-      markdown,
-      inputPath,
-      input,
-      stylesheetHrefForOutput(outputName),
-      result.warnings,
-    );
+    const rendered = await renderMarkdownFile(markdown, inputPath, input, outputName, result.warnings);
+    renderedFiles.push({ outputName, ...rendered });
+  }
+
+  if (!hasExplicitInputs) {
+    await removeStaleHtml(outputDir, inputs.map((input) => outputFileName(input)));
+  }
+
+  if (renderedFiles.some((rendered) => rendered.hasMermaid)) {
+    const mermaidAssets = await writeMermaidAssets(outputDir);
+    result.generated.push(...mermaidAssets.map((assetPath) => relativePath(cwd, assetPath)));
+  } else {
+    await removeMermaidAssets(outputDir);
+  }
+
+  for (const { outputName, html } of renderedFiles) {
     const outputPath = path.join(outputDir, outputName);
     await mkdir(path.dirname(outputPath), { recursive: true });
     await writeFile(outputPath, html, "utf8");
@@ -451,15 +479,22 @@ async function renderMarkdownFile(
   markdown: string,
   inputPath: string,
   inputName: string,
-  stylesheetHref: string,
+  outputName: string,
   warnings: string[],
-): Promise<string> {
+): Promise<RenderedMarkdownFile> {
   const md = createMarkdownIt();
   const tokens = md.parse(markdown, {});
+  const hasMermaid = hasMermaidDiagram(tokens);
   await embedLocalImages(tokens, path.dirname(inputPath), inputName, warnings);
   const body = md.renderer.render(tokens, md.options, {});
   const title = firstHeading(tokens) ?? inputName.replace(/\.md$/i, "");
-  return renderDocument(title, body, stylesheetHref);
+  const html = renderDocument(
+    title,
+    body,
+    stylesheetHrefForOutput(outputName),
+    scriptHrefsForOutput(outputName, hasMermaid),
+  );
+  return { html, hasMermaid };
 }
 
 function createMarkdownIt(): MarkdownIt {
@@ -515,6 +550,10 @@ function createMarkdownIt(): MarkdownIt {
   md.renderer.rules.fence = (tokens, idx) => {
     const token = tokens[idx];
     const langName = token.info.trim().split(/\s+/)[0] ?? "";
+    if (isMermaidFenceInfo(token.info)) {
+      return `<pre class="mum-mermaid mermaid">${escapeHtml(token.content)}</pre>\n`;
+    }
+
     const languageClass = langName ? ` language-${escapeHtmlAttribute(langName)}` : "";
     return `<pre class="mum-code-block"><code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
   };
@@ -550,6 +589,20 @@ async function embedLocalImages(
   }
 }
 
+function hasMermaidDiagram(tokens: MarkdownToken[]): boolean {
+  return tokens.some((token) => {
+    if (token.type === "fence" && isMermaidFenceInfo(token.info)) {
+      return true;
+    }
+
+    return token.children ? hasMermaidDiagram(token.children) : false;
+  });
+}
+
+function isMermaidFenceInfo(info: string): boolean {
+  return info.trimStart().toLowerCase().startsWith("mermaid");
+}
+
 async function embedImageToken(
   token: MarkdownToken,
   sourceDir: string,
@@ -581,7 +634,12 @@ async function embedImageToken(
   }
 }
 
-function renderDocument(title: string, body: string, stylesheetHref: string): string {
+function renderDocument(title: string, body: string, stylesheetHref: string, scriptHrefs: string[] = []): string {
+  const scripts = scriptHrefs
+    .map((scriptHref) => `<script defer src="${escapeHtmlAttribute(scriptHref)}"></script>`)
+    .join("\n");
+  const scriptBlock = scripts ? `\n${scripts}` : "";
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -590,7 +648,7 @@ function renderDocument(title: string, body: string, stylesheetHref: string): st
 <meta name="color-scheme" content="light dark">
 <meta name="generator" content="make-up-markdown 0.1.0">
 <title>${escapeHtml(title)}</title>
-<link rel="stylesheet" href="${escapeHtmlAttribute(stylesheetHref)}">
+<link rel="stylesheet" href="${escapeHtmlAttribute(stylesheetHref)}">${scriptBlock}
 </head>
 <body>
 <main class="mum-document">
@@ -604,6 +662,27 @@ async function writeStylesheet(outputDir: string, design: DesignTokens): Promise
   const stylesheetPath = path.join(outputDir, "style.css");
   await writeFile(stylesheetPath, renderCss(design), "utf8");
   return stylesheetPath;
+}
+
+async function writeMermaidAssets(outputDir: string): Promise<string[]> {
+  const bundlePath = path.join(outputDir, MERMAID_BUNDLE_FILE);
+  const initPath = path.join(outputDir, MERMAID_INIT_FILE);
+
+  await copyFile(require.resolve("mermaid/dist/mermaid.min.js"), bundlePath);
+  await writeFile(initPath, MERMAID_INIT_JS, "utf8");
+
+  return [bundlePath, initPath];
+}
+
+async function removeMermaidAssets(outputDir: string): Promise<void> {
+  await Promise.all(
+    MERMAID_ASSET_FILES.map(async (assetName) => {
+      const assetPath = path.join(outputDir, assetName);
+      if (await pathExists(assetPath)) {
+        await unlink(assetPath);
+      }
+    }),
+  );
 }
 
 async function writeDocumentationIndex(outputDir: string): Promise<string> {
@@ -856,6 +935,7 @@ body {
 .mum-list,
 .mum-blockquote,
 .mum-code-block,
+.mum-mermaid,
 .mum-table {
   margin: 0 0 var(--mum-space-md);
 }
@@ -896,6 +976,23 @@ body {
   padding: 0;
   background: transparent;
   color: var(--mum-text);
+}
+
+.mum-mermaid {
+  overflow-x: auto;
+  padding: var(--mum-space-md);
+  background: var(--mum-surface);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-md);
+  color: var(--mum-text);
+  font-family: var(--mum-mono-font);
+}
+
+.mum-mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
 }
 
 .mum-blockquote {
@@ -1054,13 +1151,25 @@ function outputFileName(inputName: string): string {
 }
 
 function stylesheetHrefForOutput(outputName: string): string {
+  return assetHrefForOutput(outputName, "style.css");
+}
+
+function scriptHrefsForOutput(outputName: string, includeMermaid: boolean): string[] {
+  if (!includeMermaid) {
+    return [];
+  }
+
+  return MERMAID_ASSET_FILES.map((assetName) => assetHrefForOutput(outputName, assetName));
+}
+
+function assetHrefForOutput(outputName: string, assetName: string): string {
   const outputDir = path.posix.dirname(outputName);
   if (outputDir === ".") {
-    return "style.css";
+    return assetName;
   }
 
   const depth = outputDir.split("/").filter(Boolean).length;
-  return `${"../".repeat(depth)}style.css`;
+  return `${"../".repeat(depth)}${assetName}`;
 }
 
 function firstHeading(tokens: MarkdownToken[]): string | undefined {

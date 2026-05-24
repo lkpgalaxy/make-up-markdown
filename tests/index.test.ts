@@ -336,6 +336,88 @@ describe("renderProject", () => {
     expect(html).not.toContain("assets/pixel.png");
   });
 
+  it("generates and links Mermaid assets only for Mermaid diagrams and removes them when no longer needed", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await mkdir(path.join(cwd, "docs"));
+    await writeFile(
+      path.join(cwd, "README.md"),
+      "# Root Flow\n\n```mermaid\nflowchart TD\nA-->B\n```\n",
+      "utf8",
+    );
+    await writeFile(
+      path.join(cwd, "docs", "sequence.md"),
+      "# Nested Sequence\n\n```mermaid\nsequenceDiagram\nBob->>Alice: Hi\n```\n",
+      "utf8",
+    );
+
+    const first = await renderProject({ cwd });
+    const rootHtml = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+    const nestedHtml = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "sequence.html"), "utf8");
+    const designHtml = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "DESIGN-MD.html"), "utf8");
+
+    expect(first.generated).toEqual([
+      ".make-up-markdown/style.css",
+      ".make-up-markdown/mermaid.min.js",
+      ".make-up-markdown/mermaid-init.js",
+      ".make-up-markdown/DESIGN-MD.html",
+      ".make-up-markdown/README.html",
+      ".make-up-markdown/docs/sequence.html",
+      ".make-up-markdown/index.html",
+    ]);
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mermaid.min.js"), "utf8")).resolves.toContain(
+      "mermaid",
+    );
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mermaid-init.js"), "utf8")).resolves.toContain(
+      'securityLevel: "strict"',
+    );
+    expect(rootHtml).toContain('<script defer src="mermaid.min.js"></script>');
+    expect(rootHtml).toContain('<script defer src="mermaid-init.js"></script>');
+    expect(nestedHtml).toContain('<script defer src="../mermaid.min.js"></script>');
+    expect(nestedHtml).toContain('<script defer src="../mermaid-init.js"></script>');
+    expect(designHtml).not.toContain("mermaid.min.js");
+
+    await writeFile(path.join(cwd, "README.md"), "# Root\n\nNo diagrams.\n", "utf8");
+    await writeFile(path.join(cwd, "docs", "sequence.md"), "# Nested\n\nNo diagrams.\n", "utf8");
+
+    const second = await renderProject({ cwd });
+    const outputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
+    const rootHtmlAgain = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+
+    expect(second.generated).toEqual([
+      ".make-up-markdown/style.css",
+      ".make-up-markdown/DESIGN-MD.html",
+      ".make-up-markdown/README.html",
+      ".make-up-markdown/docs/sequence.html",
+      ".make-up-markdown/index.html",
+    ]);
+    expect(outputNames).not.toContain("mermaid.min.js");
+    expect(outputNames).not.toContain("mermaid-init.js");
+    expect(rootHtmlAgain).not.toContain("mermaid.min.js");
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mermaid.min.js"), "utf8")).rejects.toThrow();
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mermaid-init.js"), "utf8")).rejects.toThrow();
+  });
+
+  it("renders flowchart Mermaid fences as diagram containers without warnings", async () => {
+    const html = makeUpMarkdown("```mermaid\nflowchart TD\nA-->B\n```\n");
+    expect(html).toContain('<pre class="mum-mermaid mermaid">');
+    expect(html).toContain("flowchart TD");
+    expect(html).not.toContain("mum-code-block-code language-mermaid");
+
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await writeFile(path.join(cwd, "README.md"), "# Flow\n\n```mermaid\nflowchart TD\nA-->B\n```\n", "utf8");
+
+    const result = await renderProject({ cwd });
+    const renderedHtml = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+
+    expect(result.generated).toContain(".make-up-markdown/mermaid.min.js");
+    expect(result.generated).toContain(".make-up-markdown/mermaid-init.js");
+    expect(result.warnings).toEqual([]);
+    expect(renderedHtml).toContain('<pre class="mum-mermaid mermaid">');
+    expect(renderedHtml).not.toContain("mum-code-block-code language-mermaid");
+  });
+
   it("renders Markdown elements with semantic mum classes and GFM behavior", () => {
     const html = makeUpMarkdown(`# Heading
 
@@ -385,6 +467,18 @@ const value = 1;
     expect(html).toContain('<th class="mum-table-cell mum-table-header">Name</th>');
     expect(html).toContain('<td class="mum-table-cell">A</td>');
     expect(html).toContain('<hr class="mum-hr">');
+  });
+
+  it("renders Mermaid fences as browser-renderable diagram containers", () => {
+    const sequenceHtml = makeUpMarkdown("```mermaid\n%% comment\n\nsequenceDiagram\nAlice->>Bob: <hello & goodbye>\n```\n");
+    const flowchartHtml = makeUpMarkdown("```mermaid\nflowchart TD\nA-->B\n```\n");
+
+    expect(sequenceHtml).toContain('<pre class="mum-mermaid mermaid">');
+    expect(sequenceHtml).toContain("sequenceDiagram\nAlice-&gt;&gt;Bob: &lt;hello &amp; goodbye&gt;");
+    expect(sequenceHtml).not.toContain("mum-code-block-code language-mermaid");
+    expect(flowchartHtml).toContain('<pre class="mum-mermaid mermaid">');
+    expect(flowchartHtml).toContain("flowchart TD\nA--&gt;B");
+    expect(flowchartHtml).not.toContain("mum-code-block-code language-mermaid");
   });
 
   it("warns when supported local images cannot be embedded and unsupported images are referenced", async () => {
