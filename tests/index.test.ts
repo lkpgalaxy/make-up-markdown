@@ -131,10 +131,12 @@ describe("renderProject", () => {
     expect(index).toBe(indexAgain);
     expect(await readFile(path.join(cwd, "README.md"), "utf8")).toBe(before);
     expect(html).toContain('<link rel="stylesheet" href="style.css">');
+    expect(html).toContain('<meta name="color-scheme" content="light dark">');
     expect(html).toContain('<a href="docs/guide.md" class="mum-link">guide</a>');
     expect(html).toContain('<img src="https://example.com/image.png" alt="remote" class="mum-image">');
     expect(html).not.toContain("<style>");
     expect(index).toContain('<link rel="stylesheet" href="style.css">');
+    expect(index).toContain('<meta name="color-scheme" content="light dark">');
     expect(index).not.toContain("<style>");
     expect(outputNames.sort()).toEqual([
       "DESIGN-MD.html",
@@ -145,10 +147,23 @@ describe("renderProject", () => {
       "style.css",
     ]);
     const stylesheet = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "style.css"), "utf8");
+    expect(stylesheet).toContain("color-scheme: light dark;");
+    expect(stylesheet).toContain("--mum-background-light: #F8FAFC;");
+    expect(stylesheet).toContain("--mum-surface-light: #FFFFFF;");
+    expect(stylesheet).toContain("--mum-text-light: #111827;");
+    expect(stylesheet).toContain("--mum-muted-light: #4B5563;");
+    expect(stylesheet).toContain("--mum-border-light: #D1D5DB;");
+    expect(stylesheet).toContain("--mum-primary-light: #2563EB;");
+    expect(stylesheet).toContain("--mum-code-background-light: #F3F4F6;");
+    expect(stylesheet).toContain("--mum-background-dark: #0F172A;");
+    expect(stylesheet).toContain("--mum-surface-dark: #111827;");
+    expect(stylesheet).toContain("@media (prefers-color-scheme: dark)");
+    expect(stylesheet).toContain("@supports (color: light-dark(white, black))");
     expect(stylesheet).toContain(".mum-heading");
     expect(stylesheet).toContain(".mum-h1");
     expect(stylesheet).toContain(".mum-link");
     expect(stylesheet).toContain(".mum-task-list");
+    expect(stylesheet).not.toContain("@keyframes");
     expect(index).toContain('<h1 class="mum-heading mum-h1">Documentation Index</h1>');
     expect(index).toContain('<nav aria-label="Generated documentation">');
     expect(index).toContain('<a class="mum-link" href="DESIGN-MD.html">DESIGN-MD.html</a>');
@@ -160,7 +175,7 @@ describe("renderProject", () => {
       index.indexOf('<h2 class="mum-heading mum-h2" id="section-2">docs</h2>'),
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, DEFAULT_DESIGN_FILE.replace(".md", ".html")), "utf8")).resolves.toContain(
-      '<h1 class="mum-heading mum-h1">Make Up Markdown Starter</h1>',
+      '<h1 class="mum-heading mum-h1">Basic Docs</h1>',
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "agents.html"), "utf8")).resolves.toContain(
       '<h1 class="mum-heading mum-h1">Agents</h1>',
@@ -411,6 +426,22 @@ const value = 1;
     expect(noFrontMatterResult.warnings).toEqual([
       "DESIGN-MD.md has no YAML front matter; using built-in design defaults.",
     ]);
+  });
+
+  it("uses custom light theme tokens when provided by the design file", async () => {
+    const cwd = await tempProject();
+    await writeFile(
+      path.join(cwd, DEFAULT_DESIGN_FILE),
+      STARTER_DESIGN_MD.replace('primary: "#2563EB"', 'primary: "#0F766E"'),
+      "utf8",
+    );
+    await writeFile(path.join(cwd, "README.md"), "# Custom Theme\n", "utf8");
+
+    await renderProject({ cwd });
+
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "style.css"), "utf8")).resolves.toContain(
+      "--mum-primary-light: #0F766E;",
+    );
   });
 
   it("fails clearly for malformed design front matter and empty projects", async () => {

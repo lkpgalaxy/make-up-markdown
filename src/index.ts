@@ -68,7 +68,7 @@ const BUILT_IN_DESIGN: DesignTokens = {
     text: "#111827",
     muted: "#4B5563",
     border: "#D1D5DB",
-    primary: "#155EEF",
+    primary: "#2563EB",
     onPrimary: "#FFFFFF",
     codeBackground: "#F3F4F6",
   },
@@ -108,10 +108,10 @@ const SUPPORTED_IMAGE_TYPES = new Map<string, string>([
 
 export const STARTER_DESIGN_MD = `---
 version: alpha
-name: Make Up Markdown Starter
+name: Basic Docs
 description: Local documentation presentation tokens for make-up-markdown output.
 colors:
-  primary: "#155EEF"
+  primary: "#2563EB"
   on-primary: "#FFFFFF"
   background: "#F8FAFC"
   surface: "#FFFFFF"
@@ -188,7 +188,7 @@ components:
     height: 1px
 ---
 
-# Make Up Markdown Starter
+# Basic Docs
 
 ## Overview
 
@@ -221,6 +221,7 @@ Links, tables, code blocks, blockquotes, images, and horizontal rules should use
 ## Do's and Don'ts
 
 - Do use the YAML front matter tokens as the implementation source of truth.
+- Do support both light and dark system color schemes.
 - Do keep generated pages self-contained and deterministic.
 - Don't add remote fonts, scripts, analytics, or fetched assets to generated output.
 `;
@@ -586,6 +587,7 @@ function renderDocument(title: string, body: string, stylesheetHref: string): st
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <meta name="generator" content="make-up-markdown 0.1.0">
 <title>${escapeHtml(title)}</title>
 <link rel="stylesheet" href="${escapeHtmlAttribute(stylesheetHref)}">
@@ -644,6 +646,7 @@ function renderIndexDocument(pages: string[]): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <meta name="generator" content="make-up-markdown 0.1.0">
 <title>Documentation Index</title>
 <link rel="stylesheet" href="style.css">
@@ -714,15 +717,34 @@ function groupIndexPages(pages: string[]): Array<{ folder: string; pages: string
 function renderCss(design: DesignTokens): string {
   const { colors, typography, rounded, spacing } = design;
   return `:root {
-  color-scheme: light;
-  --mum-background: ${colors.background};
-  --mum-surface: ${colors.surface};
-  --mum-text: ${colors.text};
-  --mum-muted: ${colors.muted};
-  --mum-border: ${colors.border};
-  --mum-primary: ${colors.primary};
-  --mum-on-primary: ${colors.onPrimary};
-  --mum-code-background: ${colors.codeBackground};
+  color-scheme: light dark;
+  accent-color: var(--mum-primary);
+  scrollbar-color: var(--mum-border) var(--mum-background);
+  --mum-background-light: ${colors.background};
+  --mum-surface-light: ${colors.surface};
+  --mum-text-light: ${colors.text};
+  --mum-muted-light: ${colors.muted};
+  --mum-border-light: ${colors.border};
+  --mum-primary-light: ${colors.primary};
+  --mum-on-primary-light: ${colors.onPrimary};
+  --mum-code-background-light: ${colors.codeBackground};
+  --mum-background-dark: #0F172A;
+  --mum-surface-dark: #111827;
+  --mum-text-dark: #E5E7EB;
+  --mum-muted-dark: #9CA3AF;
+  --mum-border-dark: #374151;
+  --mum-primary-dark: #60A5FA;
+  --mum-on-primary-dark: #0B1220;
+  --mum-code-background-dark: #1F2937;
+  --mum-background: var(--mum-background-light);
+  --mum-surface: var(--mum-surface-light);
+  --mum-text: var(--mum-text-light);
+  --mum-muted: var(--mum-muted-light);
+  --mum-border: var(--mum-border-light);
+  --mum-primary: var(--mum-primary-light);
+  --mum-on-primary: var(--mum-on-primary-light);
+  --mum-code-background: var(--mum-code-background-light);
+  --mum-document-shadow: 0 1px 2px rgb(16 24 40 / 6%);
   --mum-body-font: ${typography.bodyFont};
   --mum-mono-font: ${typography.monoFont};
   --mum-body-size: ${typography.bodySize};
@@ -740,6 +762,33 @@ function renderCss(design: DesignTokens): string {
   --mum-space-xl: ${spacing.xl};
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    --mum-background: var(--mum-background-dark);
+    --mum-surface: var(--mum-surface-dark);
+    --mum-text: var(--mum-text-dark);
+    --mum-muted: var(--mum-muted-dark);
+    --mum-border: var(--mum-border-dark);
+    --mum-primary: var(--mum-primary-dark);
+    --mum-on-primary: var(--mum-on-primary-dark);
+    --mum-code-background: var(--mum-code-background-dark);
+    --mum-document-shadow: none;
+  }
+}
+
+@supports (color: light-dark(white, black)) {
+  :root {
+    --mum-background: light-dark(var(--mum-background-light), var(--mum-background-dark));
+    --mum-surface: light-dark(var(--mum-surface-light), var(--mum-surface-dark));
+    --mum-text: light-dark(var(--mum-text-light), var(--mum-text-dark));
+    --mum-muted: light-dark(var(--mum-muted-light), var(--mum-muted-dark));
+    --mum-border: light-dark(var(--mum-border-light), var(--mum-border-dark));
+    --mum-primary: light-dark(var(--mum-primary-light), var(--mum-primary-dark));
+    --mum-on-primary: light-dark(var(--mum-on-primary-light), var(--mum-on-primary-dark));
+    --mum-code-background: light-dark(var(--mum-code-background-light), var(--mum-code-background-dark));
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -751,6 +800,8 @@ body {
   font-family: var(--mum-body-font);
   font-size: var(--mum-body-size);
   line-height: var(--mum-body-line-height);
+  min-height: 100vh;
+  overflow-wrap: break-word;
 }
 
 .mum-document {
@@ -760,6 +811,7 @@ body {
   background: var(--mum-surface);
   border: 1px solid var(--mum-border);
   border-radius: var(--mum-radius-lg);
+  box-shadow: var(--mum-document-shadow);
 }
 
 .mum-document > :first-child {
@@ -775,6 +827,7 @@ body {
   font-weight: var(--mum-heading-weight);
   line-height: 1.2;
   letter-spacing: 0;
+  text-wrap: balance;
 }
 
 .mum-h1 {
@@ -813,6 +866,12 @@ body {
   text-underline-offset: 0.18em;
 }
 
+.mum-link:focus-visible {
+  outline: 2px solid var(--mum-primary);
+  outline-offset: 2px;
+  border-radius: var(--mum-radius-sm);
+}
+
 .mum-code,
 .mum-code-block {
   font-family: var(--mum-mono-font);
@@ -821,6 +880,7 @@ body {
 .mum-code-inline {
   padding: 0.15em 0.35em;
   background: var(--mum-code-background);
+  color: var(--mum-text);
   border-radius: var(--mum-radius-sm);
 }
 
@@ -828,18 +888,20 @@ body {
   overflow-x: auto;
   padding: var(--mum-space-md);
   background: var(--mum-code-background);
+  border: 1px solid var(--mum-border);
   border-radius: var(--mum-radius-md);
 }
 
 .mum-code-block-code {
   padding: 0;
   background: transparent;
+  color: var(--mum-text);
 }
 
 .mum-blockquote {
   padding-left: var(--mum-space-md);
   color: var(--mum-muted);
-  border-left: 4px solid var(--mum-border);
+  border-left: 4px solid var(--mum-primary);
 }
 
 .mum-list {
@@ -859,6 +921,7 @@ body {
 
 .mum-task-list-checkbox {
   flex: 0 0 auto;
+  accent-color: var(--mum-primary);
   transform: translateY(0.12em);
 }
 
@@ -879,6 +942,7 @@ body {
 .mum-table-header {
   font-weight: var(--mum-heading-weight);
   background: var(--mum-code-background);
+  color: var(--mum-text);
 }
 
 .mum-image {
@@ -904,6 +968,7 @@ body {
     border-left: 0;
     border-right: 0;
     border-radius: 0;
+    box-shadow: none;
   }
 }`;
 }
