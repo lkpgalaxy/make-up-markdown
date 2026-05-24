@@ -4,10 +4,10 @@
 
 `make-up-markdown` is a package and CLI for turning Markdown documentation into polished local HTML presentations. It should work deterministically, require no network calls during rendering, and produce output that can be opened directly from disk or committed as generated artifacts when desired.
 
-The package centers on two commands:
+The package centers on two CLI commands:
 
-- `make-up-markdown init`
-- `make-up-markdown render`
+- `mum init`
+- `mum render`
 
 The default output directory is `.make-up-markdown/`. During initialization, the CLI adds `.make-up-markdown/` to `.gitignore` so generated output stays out of source control unless the user intentionally changes that behavior.
 
@@ -32,11 +32,11 @@ The package name is `make-up-markdown`.
 
 ### CLI Name
 
-The executable command is `make-up-markdown`.
+The executable command is `mum`.
 
 ### Commands
 
-#### `make-up-markdown init`
+#### `mum init`
 
 Initializes the current project for `make-up-markdown`.
 
@@ -56,23 +56,23 @@ Optional future flags:
 - `--output <dir>` to configure a non-default output directory.
 - `--design <path>` to use a design file outside the project root.
 
-#### `make-up-markdown render`
+#### `mum render`
 
 Renders Markdown files into self-contained HTML.
 
 Expected behavior:
 
 - Read Markdown input from the current project.
-- By default, render `README.md` when it exists, without modifying it.
-- If `README.md` is missing, render Markdown files in the project root.
-- Exclude `DESIGN-MD.md`, files under `.make-up-markdown/`, dependency directories, hidden directories, and generated output.
+- By default, render visible Markdown files recursively, including `README.md`, nested Markdown files, and `DESIGN-MD.md`, without modifying them.
+- Exclude files under `.make-up-markdown/`, dependency directories, `.git/`, hidden files, hidden directories, and generated output during default discovery.
 - Use `DESIGN-MD.md` as the local design source.
 - Produce deterministic HTML output in `.make-up-markdown/`.
 - Produce one `.html` output per rendered Markdown file.
+- Accept optional positional Markdown file arguments, for example `mum render README.md docs/guide.md`, and render only those files.
 - Render `README.md` to `.make-up-markdown/README.html`.
-- Render other root Markdown files to `.make-up-markdown/<markdown-file-name>.html`, for example `guide.md` to `.make-up-markdown/guide.html`.
+- Render other Markdown files to mirrored output paths, for example `docs/guide.md` to `.make-up-markdown/docs/guide.html`.
 - Refresh generated output on every render so `.make-up-markdown/` reflects the latest Markdown inputs.
-- Remove stale generated HTML files that no longer correspond to current Markdown inputs.
+- Remove stale generated HTML files that no longer correspond to current Markdown inputs during default rendering.
 - Inline required CSS so the rendered HTML has no generated sibling asset dependency.
 - Preserve Markdown links in the generated HTML.
 - Preserve remote image URLs in the generated HTML without fetching them during rendering.
@@ -174,7 +174,7 @@ Expected behavior:
 - Make error messages specific enough to identify the failed file, command, or configuration value.
 - Prefer explicit defaults over hidden inference.
 - Support Node.js `>=20`.
-- Expose the CLI through the npm `bin` field, for example `"make-up-markdown": "./dist/cli.js"`.
+- Expose the CLI through the npm `bin` field, for example `"mum": "./dist/cli.js"`.
 - Keep the CLI entrypoint separate from the library API, for example `src/cli.ts` plus `src/index.ts`.
 - Embed the starter `DESIGN-MD.md` template in TypeScript for v1 so npm packaging does not depend on copying template files.
 - Use dependencies deliberately:
@@ -186,7 +186,7 @@ Expected behavior:
 
 ## Plan Validation
 
-- Confirm `make-up-markdown-plan.md` exists.
+- Confirm `docs/logic.md` exists.
 - Confirm the plan contains the required sections:
   - `Summary`
   - `Key Changes`
@@ -224,9 +224,9 @@ Expected behavior:
 
 ## Assumptions
 
-- `make-up-markdown-plan.md` should be created as a new file rather than appended to an existing file.
+- `docs/logic.md` should be created as a new file rather than appended to an existing file.
 - The file should contain the package plan only, not implementation code.
-- The selected package and CLI name is `make-up-markdown`.
+- The selected package name is `make-up-markdown`, and the selected CLI name is `mum`.
 - The selected commands are `init` and `render`.
 - The selected output directory is `.make-up-markdown/`.
 - Rendering is deterministic local Markdown to one local `.html` file per Markdown input file.
