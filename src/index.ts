@@ -287,6 +287,9 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
     result.generated.push(relativePath(cwd, outputPath));
   }
 
+  const indexPath = await writeDocumentationIndex(outputDir, design);
+  result.generated.push(relativePath(cwd, indexPath));
+
   return result;
 }
 
@@ -521,6 +524,112 @@ ${body}</main>
 </body>
 </html>
 `;
+}
+
+async function writeDocumentationIndex(outputDir: string, design: DesignTokens): Promise<string> {
+  const indexPath = path.join(outputDir, "index.html");
+  const pages = await discoverGeneratedHtmlPages(outputDir);
+  const html = renderIndexDocument(pages, design);
+  await writeFile(indexPath, html, "utf8");
+  return indexPath;
+}
+
+async function discoverGeneratedHtmlPages(outputDir: string): Promise<string[]> {
+  const pages: string[] = [];
+
+  async function walk(dir: string, relativeDir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const relativeName = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+      const entryPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        await walk(entryPath, relativeName);
+      } else if (
+        entry.isFile() &&
+        entry.name.toLowerCase().endsWith(".html") &&
+        relativeName !== "index.html"
+      ) {
+        pages.push(relativeName);
+      }
+    }
+  }
+
+  await walk(outputDir, "");
+  return pages.sort(compareStable);
+}
+
+function renderIndexDocument(pages: string[], design: DesignTokens): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="make-up-markdown 0.1.0">
+<title>Documentation Index</title>
+<style>
+${renderCss(design)}
+</style>
+</head>
+<body>
+<main class="document">
+<h1>Documentation Index</h1>
+<nav aria-label="Generated documentation">
+${renderIndexSections(pages)}
+</nav>
+</main>
+</body>
+</html>
+`;
+}
+
+function renderIndexSections(pages: string[]): string {
+  if (pages.length === 0) {
+    return "<p>No generated HTML pages were found.</p>";
+  }
+
+  return groupIndexPages(pages)
+    .map((group, index) => {
+      const headingId = `section-${index + 1}`;
+      const title = group.folder === "" ? "Root" : group.folder;
+      const links = group.pages
+        .map((page) => `  <li><a href="${escapeHtmlAttribute(page)}">${escapeHtml(page)}</a></li>`)
+        .join("\n");
+
+      return `<section aria-labelledby="${headingId}">
+<h2 id="${headingId}">${escapeHtml(title)}</h2>
+<ul>
+${links}
+</ul>
+</section>`;
+    })
+    .join("\n");
+}
+
+function groupIndexPages(pages: string[]): Array<{ folder: string; pages: string[] }> {
+  const grouped = new Map<string, string[]>();
+
+  for (const page of pages) {
+    const folder = path.posix.dirname(page);
+    const groupName = folder === "." ? "" : folder;
+    grouped.set(groupName, [...(grouped.get(groupName) ?? []), page]);
+  }
+
+  return [...grouped.entries()]
+    .sort(([a], [b]) => {
+      if (a === "") {
+        return -1;
+      }
+      if (b === "") {
+        return 1;
+      }
+      return compareStable(a, b);
+    })
+    .map(([folder, groupPages]) => ({
+      folder,
+      pages: groupPages.sort(compareStable),
+    }));
 }
 
 function renderCss(design: DesignTokens): string {
@@ -826,6 +935,10 @@ function escapeHtml(value: string): string {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return escapeHtml(value).replaceAll("'", "&#39;");
 }
 
 function emptyResult(): CommandResult {

@@ -104,8 +104,10 @@ describe("renderProject", () => {
 
     const first = await renderProject({ cwd });
     const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+    const index = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
     const second = await renderProject({ cwd });
     const htmlAgain = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+    const indexAgain = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
     const outputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
 
     expect(first.generated).toEqual([
@@ -113,20 +115,33 @@ describe("renderProject", () => {
       ".make-up-markdown/README.html",
       ".make-up-markdown/agents.html",
       ".make-up-markdown/docs/guide.html",
+      ".make-up-markdown/index.html",
     ]);
     expect(second.generated).toEqual([
       ".make-up-markdown/DESIGN-MD.html",
       ".make-up-markdown/README.html",
       ".make-up-markdown/agents.html",
       ".make-up-markdown/docs/guide.html",
+      ".make-up-markdown/index.html",
     ]);
     expect(html).toBe(htmlAgain);
+    expect(index).toBe(indexAgain);
     expect(await readFile(path.join(cwd, "README.md"), "utf8")).toBe(before);
     expect(html).toContain('<a href="docs/guide.md">guide</a>');
     expect(html).toContain('<img src="https://example.com/image.png" alt="remote">');
     expect(html).toContain("<style>");
     expect(html).not.toContain('rel="stylesheet"');
-    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "README.html", "agents.html", "docs"]);
+    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "README.html", "agents.html", "docs", "index.html"]);
+    expect(index).toContain("<h1>Documentation Index</h1>");
+    expect(index).toContain('<nav aria-label="Generated documentation">');
+    expect(index).toContain('<a href="DESIGN-MD.html">DESIGN-MD.html</a>');
+    expect(index).toContain('<a href="README.html">README.html</a>');
+    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
+    expect(index).not.toContain('<a href="index.html">index.html</a>');
+    expect(index).not.toContain("stale.html");
+    expect(index.indexOf("<h2 id=\"section-1\">Root</h2>")).toBeLessThan(
+      index.indexOf("<h2 id=\"section-2\">docs</h2>"),
+    );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, DEFAULT_DESIGN_FILE.replace(".md", ".html")), "utf8")).resolves.toContain(
       "<h1>Make Up Markdown Starter</h1>",
     );
@@ -168,12 +183,21 @@ describe("renderProject", () => {
       ".make-up-markdown/a.html",
       ".make-up-markdown/b.html",
       ".make-up-markdown/docs/guide.html",
+      ".make-up-markdown/index.html",
     ]);
+    const index = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "a.html"), "utf8")).resolves.toContain("<h1>A</h1>");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "b.html"), "utf8")).resolves.toContain("<h1>B</h1>");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
       "<h1>Guide</h1>",
     );
+    expect(index).toContain('<a href="DESIGN-MD.html">DESIGN-MD.html</a>');
+    expect(index).toContain('<a href="a.html">a.html</a>');
+    expect(index).toContain('<a href="b.html">b.html</a>');
+    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
+    expect(index).not.toContain(".hidden.html");
+    expect(index).not.toContain("dependency.html");
+    expect(index).not.toContain("generated.html");
   });
 
   it("removes generated HTML recursively when the corresponding Markdown source is removed", async () => {
@@ -189,9 +213,16 @@ describe("renderProject", () => {
     const outputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
     const docsOutputNames = await readdir(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs"));
 
-    expect(result.generated).toEqual([".make-up-markdown/DESIGN-MD.html", ".make-up-markdown/a.html"]);
-    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "a.html", "docs"]);
+    expect(result.generated).toEqual([
+      ".make-up-markdown/DESIGN-MD.html",
+      ".make-up-markdown/a.html",
+      ".make-up-markdown/index.html",
+    ]);
+    expect(outputNames.sort()).toEqual(["DESIGN-MD.html", "a.html", "docs", "index.html"]);
     expect(docsOutputNames).toEqual([]);
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8")).resolves.not.toContain(
+      "docs/b.html",
+    );
   });
 
   it("renders only explicit Markdown inputs and leaves unrelated generated HTML in place", async () => {
@@ -209,7 +240,9 @@ describe("renderProject", () => {
     expect(result.generated).toEqual([
       ".make-up-markdown/docs/guide.html",
       ".make-up-markdown/.hidden.html",
+      ".make-up-markdown/index.html",
     ]);
+    const index = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "index.html"), "utf8");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8")).resolves.toContain(
       "<h1>Guide</h1>",
     );
@@ -218,6 +251,10 @@ describe("renderProject", () => {
     );
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "stale.html"), "utf8")).resolves.toBe("stale");
     await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8")).rejects.toThrow();
+    expect(index).toContain('<a href=".hidden.html">.hidden.html</a>');
+    expect(index).toContain('<a href="docs/guide.html">docs/guide.html</a>');
+    expect(index).toContain('<a href="stale.html">stale.html</a>');
+    expect(index).not.toContain("README.html");
   });
 
   it("rejects explicit inputs that are missing, not Markdown, or outside the project", async () => {
@@ -249,7 +286,11 @@ describe("renderProject", () => {
     const result = await renderProject({ cwd });
     const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "docs", "guide.html"), "utf8");
 
-    expect(result.generated).toEqual([".make-up-markdown/DESIGN-MD.html", ".make-up-markdown/docs/guide.html"]);
+    expect(result.generated).toEqual([
+      ".make-up-markdown/DESIGN-MD.html",
+      ".make-up-markdown/docs/guide.html",
+      ".make-up-markdown/index.html",
+    ]);
     expect(result.warnings).toEqual([]);
     expect(html).toContain('src="data:image/png;base64,');
     expect(html).not.toContain("assets/pixel.png");
