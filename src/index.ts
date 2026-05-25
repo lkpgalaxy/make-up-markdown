@@ -3,11 +3,14 @@ import MarkdownIt from "markdown-it";
 import markdownItTaskLists from "markdown-it-task-lists";
 import { constants as fsConstants } from "node:fs";
 import { access, copyFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 export const DEFAULT_OUTPUT_DIR = ".make-up-markdown";
 export const DEFAULT_DESIGN_FILE = "DESIGN-MD.md";
+export const DEFAULT_ANNOTATIONS_FILE = `${DEFAULT_OUTPUT_DIR}/annotations.json`;
 
 export interface InitOptions {
   cwd?: string;
@@ -16,6 +19,24 @@ export interface InitOptions {
 export interface RenderOptions {
   cwd?: string;
   inputs?: string[];
+}
+
+export interface SyncOptions {
+  cwd?: string;
+  annotationsFile?: string;
+  dryRun?: boolean;
+}
+
+export interface AnnotateOptions {
+  cwd?: string;
+  inputs?: string[];
+  port?: number;
+  host?: string;
+}
+
+export interface AnnotationServer {
+  url: string;
+  close(): Promise<void>;
 }
 
 export interface CommandResult {
@@ -65,6 +86,56 @@ type MarkdownToken = ReturnType<MarkdownIt["parse"]>[number];
 interface RenderedMarkdownFile {
   html: string;
   hasMermaid: boolean;
+  annotations: RenderedAnnotation[];
+}
+
+type AnnotationKind = "NOTE" | "TIP" | "IMPORTANT" | "WARNING" | "CAUTION";
+
+interface RenderedAnnotation {
+  id: string;
+  source: string;
+  blockStartLine: number;
+  blockEndLine: number;
+  quote: string;
+  note: string;
+  kind: AnnotationKind;
+}
+
+interface AnnotationSite {
+  css: string;
+  inputs: string[];
+  pages: Map<string, string>;
+  annotationsBySource: Map<string, RenderedAnnotation[]>;
+  mermaidBundle?: string;
+  hasMermaid: boolean;
+}
+
+interface SyncAnnotation {
+  id: string;
+  source: string;
+  blockStartLine: number;
+  blockEndLine: number;
+  quote: string;
+  note: string;
+  kind: AnnotationKind;
+}
+
+interface ManagedAnnotationBlock {
+  id: string;
+  kind: AnnotationKind;
+  blockStartLine?: number;
+  blockEndLine?: number;
+  quote: string;
+  note: string;
+  start: number;
+  end: number;
+}
+
+interface FileSyncOperation {
+  start: number;
+  deleteCount: number;
+  lines: string[];
+  sequence: number;
 }
 
 const require = createRequire(import.meta.url);
@@ -72,6 +143,8 @@ const require = createRequire(import.meta.url);
 const MERMAID_BUNDLE_FILE = "mermaid.min.js";
 const MERMAID_INIT_FILE = "mermaid-init.js";
 const MERMAID_ASSET_FILES = [MERMAID_BUNDLE_FILE, MERMAID_INIT_FILE];
+const ANNOTATION_SCRIPT_FILE = "mum-annotate.js";
+const SUPPORTED_ANNOTATION_KINDS: AnnotationKind[] = ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"];
 const MERMAID_INIT_JS = `(() => {
   if (!globalThis.mermaid) {
     return;
@@ -79,6 +152,400 @@ const MERMAID_INIT_JS = `(() => {
 
   globalThis.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
   globalThis.mermaid.run({ querySelector: ".mum-mermaid", suppressErrors: true });
+})();
+`;
+
+const ANNOTATION_CSS = `
+
+.mum-annotation-button {
+  position: fixed;
+  z-index: 10;
+  min-width: 132px;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--mum-primary);
+  border-radius: var(--mum-radius-md);
+  background: var(--mum-primary);
+  color: var(--mum-on-primary);
+  font: inherit;
+  font-weight: 700;
+  box-shadow: 0 8px 18px rgb(15 23 42 / 18%);
+  cursor: pointer;
+}
+
+.mum-annotation-button[hidden] {
+  display: none;
+}
+
+.mum-annotation-dialog {
+  width: min(100% - 32px, 560px);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-md);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  padding: 0;
+}
+
+.mum-annotation-dialog::backdrop {
+  background: rgb(15 23 42 / 38%);
+}
+
+.mum-annotation-form {
+  display: grid;
+  gap: var(--mum-space-md);
+  padding: var(--mum-space-lg);
+}
+
+.mum-annotation-title {
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.2;
+}
+
+.mum-annotation-quote {
+  margin: 0;
+  padding: var(--mum-space-md);
+  border-left: 4px solid var(--mum-primary);
+  background: var(--mum-code-background);
+  color: var(--mum-muted);
+}
+
+.mum-annotation-label {
+  display: grid;
+  gap: var(--mum-space-sm);
+  font-weight: 700;
+}
+
+.mum-annotation-note {
+  min-height: 128px;
+  resize: vertical;
+  padding: var(--mum-space-sm);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  font: inherit;
+}
+
+.mum-annotation-kind {
+  padding: var(--mum-space-sm);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  font: inherit;
+}
+
+.mum-annotation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--mum-space-sm);
+}
+
+.mum-annotation-actions button {
+  min-width: 88px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.mum-annotation-actions button[type="submit"] {
+  border-color: var(--mum-primary);
+  background: var(--mum-primary);
+  color: var(--mum-on-primary);
+  font-weight: 700;
+}
+
+.mum-annotation-status {
+  position: fixed;
+  inset: auto var(--mum-space-md) var(--mum-space-md) auto;
+  z-index: 11;
+  max-width: min(420px, calc(100vw - 32px));
+  margin: 0;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-md);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  box-shadow: 0 8px 18px rgb(15 23 42 / 14%);
+}
+
+.mum-annotation-status:empty {
+  display: none;
+}
+
+.mum-annotation-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mum-space-sm);
+  margin-top: var(--mum-space-md);
+}
+
+.mum-annotation-card-actions button {
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  font: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.mum-annotation-card-actions button:focus-visible,
+.mum-annotation-actions button:focus-visible,
+.mum-annotation-button:focus-visible,
+.mum-annotation-kind:focus-visible,
+.mum-annotation-note:focus-visible {
+  outline: 2px solid var(--mum-primary);
+  outline-offset: 2px;
+}
+`;
+
+const ANNOTATION_JS = `(() => {
+  const addButton = document.querySelector(".mum-annotation-button");
+  const dialog = document.querySelector(".mum-annotation-dialog");
+  const form = document.querySelector(".mum-annotation-form");
+  const cancelButton = document.querySelector(".mum-annotation-cancel");
+  const title = document.querySelector(".mum-annotation-title");
+  const quoteOutput = document.querySelector(".mum-annotation-quote");
+  const kindInput = document.querySelector(".mum-annotation-kind");
+  const noteInput = document.querySelector(".mum-annotation-note");
+  const status = document.querySelector(".mum-annotation-status");
+  const rail = document.querySelector("[data-mum-annotation-rail]");
+  const submitButton = form?.querySelector('button[type="submit"]');
+
+  if (!addButton || !dialog || !form || !cancelButton || !title || !quoteOutput || !kindInput || !noteInput || !status || !rail || !submitButton) {
+    return;
+  }
+
+  let pendingAnnotation = null;
+  let editingAnnotation = null;
+  let statusTimer = 0;
+
+  const annotatableSelector = "[data-mum-source][data-mum-line-start][data-mum-line-end]";
+
+  function closestAnnotatable(node) {
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    return element?.closest(annotatableSelector) ?? null;
+  }
+
+  function setStatus(message) {
+    status.textContent = message;
+    window.clearTimeout(statusTimer);
+    if (message) {
+      statusTimer = window.setTimeout(() => {
+        status.textContent = "";
+      }, 3600);
+    }
+  }
+
+  function hideButton() {
+    addButton.hidden = true;
+    pendingAnnotation = null;
+  }
+
+  function normalizeKind(kind) {
+    return ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"].includes(kind) ? kind : "NOTE";
+  }
+
+  function setRailHtml(html) {
+    rail.innerHTML = html;
+  }
+
+  function openDialog(mode, annotation) {
+    editingAnnotation = mode === "edit" ? annotation : null;
+    title.textContent = mode === "edit" ? "Edit annotation" : "Add annotation";
+    submitButton.textContent = mode === "edit" ? "Update" : "Save";
+    quoteOutput.textContent = annotation.quote;
+    kindInput.value = normalizeKind(annotation.kind);
+    noteInput.value = mode === "edit" ? annotation.note : "";
+    dialog.showModal();
+    noteInput.focus();
+  }
+
+  function annotationFromSelection() {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null;
+    }
+
+    const range = selection.getRangeAt(0);
+    const block = closestAnnotatable(range.startContainer);
+    const endBlock = closestAnnotatable(range.endContainer);
+    const quote = selection.toString().trim();
+
+    if (!quote) {
+      return null;
+    }
+
+    if (!block || !endBlock || block !== endBlock) {
+      setStatus("Select text inside one Markdown block.");
+      return null;
+    }
+
+    return {
+      block,
+      request: {
+        source: block.dataset.mumSource,
+        blockStartLine: Number(block.dataset.mumLineStart),
+        blockEndLine: Number(block.dataset.mumLineEnd),
+        quote,
+      },
+      rect: range.getBoundingClientRect(),
+    };
+  }
+
+  function updateSelectionControl() {
+    if (dialog.open) {
+      return;
+    }
+
+    const annotation = annotationFromSelection();
+    if (!annotation) {
+      hideButton();
+      return;
+    }
+
+    pendingAnnotation = annotation;
+    const top = Math.max(8, annotation.rect.top - addButton.offsetHeight - 8);
+    const left = Math.min(
+      window.innerWidth - addButton.offsetWidth - 8,
+      Math.max(8, annotation.rect.left + annotation.rect.width / 2 - addButton.offsetWidth / 2),
+    );
+    addButton.style.top = \`\${top}px\`;
+    addButton.style.left = \`\${left}px\`;
+    addButton.hidden = false;
+  }
+
+  function annotationFromCard(button) {
+    const card = button.closest("[data-mum-annotation-id]");
+    if (!card) {
+      return null;
+    }
+
+    return {
+      id: card.dataset.mumAnnotationId,
+      source: card.dataset.mumSource,
+      kind: normalizeKind(card.dataset.mumKind),
+      quote: card.dataset.mumQuote ?? "",
+      note: card.dataset.mumNote ?? "",
+    };
+  }
+
+  document.addEventListener("selectionchange", () => {
+    window.setTimeout(updateSelectionControl, 0);
+  });
+  document.addEventListener("keyup", updateSelectionControl);
+  document.addEventListener("mouseup", updateSelectionControl);
+
+  addButton.addEventListener("click", () => {
+    if (!pendingAnnotation) {
+      return;
+    }
+
+    openDialog("add", {
+      quote: pendingAnnotation.request.quote,
+      kind: "NOTE",
+      note: "",
+    });
+  });
+
+  cancelButton.addEventListener("click", () => {
+    editingAnnotation = null;
+    dialog.close();
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!pendingAnnotation && !editingAnnotation) {
+      return;
+    }
+
+    const note = noteInput.value.trim();
+    if (!note) {
+      setStatus("Enter a note before saving.");
+      noteInput.focus();
+      return;
+    }
+
+    const kind = normalizeKind(kindInput.value);
+    const wasEditing = Boolean(editingAnnotation);
+    const request = editingAnnotation
+      ? { source: editingAnnotation.source, kind, note }
+      : { ...pendingAnnotation.request, kind, note };
+    const endpoint = editingAnnotation
+      ? \`/api/annotations/\${encodeURIComponent(editingAnnotation.id)}\`
+      : "/api/annotations";
+
+    try {
+      const response = await fetch(endpoint, {
+        method: editingAnnotation ? "PATCH" : "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Annotation could not be saved.");
+      }
+
+      setRailHtml(payload.railHtml);
+      dialog.close();
+      hideButton();
+      editingAnnotation = null;
+      window.getSelection()?.removeAllRanges();
+      setStatus(wasEditing ? "Annotation updated." : "Annotation saved.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  rail.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-mum-annotation-action]");
+    if (!button) {
+      return;
+    }
+
+    const annotation = annotationFromCard(button);
+    if (!annotation) {
+      return;
+    }
+
+    if (button.dataset.mumAnnotationAction === "edit") {
+      openDialog("edit", annotation);
+      return;
+    }
+
+    if (button.dataset.mumAnnotationAction !== "delete") {
+      return;
+    }
+
+    if (!window.confirm("Delete this annotation?")) {
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams({ source: annotation.source });
+      const response = await fetch(\`/api/annotations/\${encodeURIComponent(annotation.id)}?\${params}\`, {
+        method: "DELETE",
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error ?? "Annotation could not be deleted.");
+      }
+
+      setRailHtml(payload.railHtml);
+      setStatus("Annotation deleted.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  });
 })();
 `;
 
@@ -286,10 +753,7 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   const outputDir = path.join(cwd, DEFAULT_OUTPUT_DIR);
   const result = emptyResult();
   const design = await loadDesign(cwd, result.warnings);
-  const hasExplicitInputs = (options.inputs?.length ?? 0) > 0;
-  const inputs = hasExplicitInputs
-    ? await validateExplicitMarkdownInputs(cwd, options.inputs ?? [])
-    : await discoverMarkdownInputs(cwd);
+  const { inputs, hasExplicitInputs } = await resolveMarkdownInputs(cwd, options.inputs);
 
   if (inputs.length === 0) {
     throw new Error("No Markdown input files were found in the project.");
@@ -333,9 +797,805 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   return result;
 }
 
+export async function startAnnotationServer(options: AnnotateOptions = {}): Promise<AnnotationServer> {
+  const cwd = path.resolve(options.cwd ?? process.cwd());
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 0;
+  const { inputs } = await resolveMarkdownInputs(cwd, options.inputs);
+
+  if (inputs.length === 0) {
+    throw new Error("No Markdown input files were found in the project.");
+  }
+
+  let site = await buildAnnotationSite(cwd, inputs);
+
+  const server = createServer(async (request, response) => {
+    try {
+      if (request.url?.startsWith("/api/annotations")) {
+        await handleAnnotationRequest(request, response, cwd, inputs, async () => {
+          site = await buildAnnotationSite(cwd, inputs);
+          return site;
+        });
+        return;
+      }
+
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        sendJson(response, 405, { error: "Method not allowed." });
+        return;
+      }
+
+      await serveAnnotationAsset(request, response, site);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, error instanceof ValidationError ? 400 : 500, { error: message });
+    }
+  });
+
+  await listen(server, port, host);
+  const address = server.address();
+  const resolvedPort = typeof address === "object" && address ? address.port : port;
+
+  return {
+    url: `http://${hostForUrl(host)}:${resolvedPort}/`,
+    close: () => closeServer(server),
+  };
+}
+
+export async function syncAnnotations(options: SyncOptions = {}): Promise<CommandResult> {
+  const cwd = path.resolve(options.cwd ?? process.cwd());
+  const annotationsPath = path.resolve(cwd, options.annotationsFile ?? DEFAULT_ANNOTATIONS_FILE);
+  const result = emptyResult();
+
+  if (!isInsideProject(cwd, annotationsPath)) {
+    throw new Error(`Annotation file "${options.annotationsFile}" must be inside the project.`);
+  }
+
+  if (!(await pathExists(annotationsPath))) {
+    result.warnings.push(`${relativePath(cwd, annotationsPath)} was not found; no annotations were synced.`);
+    return result;
+  }
+
+  const annotationFile = await readAnnotationFile(annotationsPath);
+  if (annotationFile.version !== 1) {
+    result.warnings.push(`${relativePath(cwd, annotationsPath)} has unsupported version ${annotationFile.version}; no annotations were synced.`);
+    return result;
+  }
+
+  const annotations = parseSyncAnnotations(annotationFile, relativePath(cwd, annotationsPath), result.warnings);
+  await syncAnnotationList(cwd, annotations, options.dryRun === true, result);
+
+  return result;
+}
+
 export function makeUpMarkdown(markdown: string): string {
   const md = createMarkdownIt();
-  return md.render(markdown);
+  return md.render(hideManagedAnnotationMarkers(markdown));
+}
+
+async function buildAnnotationSite(cwd: string, inputs: string[]): Promise<AnnotationSite> {
+  const warnings: string[] = [];
+  const design = await loadDesign(cwd, warnings);
+  const pages = new Map<string, string>();
+  const annotationsBySource = new Map<string, RenderedAnnotation[]>();
+  let hasMermaid = false;
+
+  for (const input of inputs) {
+    const inputPath = path.join(cwd, input);
+    const markdown = await readFile(inputPath, "utf8");
+    const outputName = outputFileName(input);
+    const rendered = await renderMarkdownFile(markdown, inputPath, input, outputName, warnings, {
+      annotationSource: input,
+    });
+    pages.set(outputName, rendered.html);
+    annotationsBySource.set(input, rendered.annotations);
+    hasMermaid = hasMermaid || rendered.hasMermaid;
+  }
+
+  pages.set("index.html", renderIndexDocument([...pages.keys()].sort(compareStable)));
+
+  return {
+    css: renderCss(design) + ANNOTATION_CSS,
+    inputs,
+    pages,
+    annotationsBySource,
+    hasMermaid,
+  };
+}
+
+async function handleAnnotationRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  cwd: string,
+  allowedInputs: string[],
+  refresh: () => Promise<AnnotationSite>,
+): Promise<void> {
+  const requestUrl = new URL(request.url ?? "/", "http://localhost");
+  const match = requestUrl.pathname.match(/^\/api\/annotations(?:\/([^/]+))?$/);
+  if (!match) {
+    sendJson(response, 404, { error: "Annotation endpoint was not found." });
+    return;
+  }
+
+  if (request.method === "POST" && !match[1]) {
+    await handleAnnotationPost(request, response, cwd, allowedInputs, refresh);
+    return;
+  }
+
+  if (request.method === "PATCH" && match[1]) {
+    await handleAnnotationPatch(request, response, cwd, allowedInputs, decodeURIComponent(match[1]), refresh);
+    return;
+  }
+
+  if (request.method === "DELETE" && match[1]) {
+    await handleAnnotationDelete(requestUrl, response, cwd, allowedInputs, decodeURIComponent(match[1]), refresh);
+    return;
+  }
+
+  sendJson(response, 405, { error: "Method not allowed." });
+}
+
+async function handleAnnotationPost(
+  request: IncomingMessage,
+  response: ServerResponse,
+  cwd: string,
+  allowedInputs: string[],
+  refresh: () => Promise<AnnotationSite>,
+): Promise<void> {
+  const body = await readJsonRequest(request);
+  const annotation = await annotationFromRequest(cwd, allowedInputs, body);
+  const result = emptyResult();
+
+  await syncAnnotationList(cwd, [annotation], false, result);
+  if (result.warnings.length > 0 || result.updated.length === 0) {
+    sendJson(response, 400, { error: result.warnings[0] ?? "Annotation could not be saved." });
+    return;
+  }
+
+  const site = await refresh();
+  sendJson(response, 201, { annotation, railHtml: railHtmlForSource(site, annotation.source) });
+}
+
+async function handleAnnotationPatch(
+  request: IncomingMessage,
+  response: ServerResponse,
+  cwd: string,
+  allowedInputs: string[],
+  id: string,
+  refresh: () => Promise<AnnotationSite>,
+): Promise<void> {
+  if (!isSafeAnnotationId(id)) {
+    throw new ValidationError("Annotation id is invalid.");
+  }
+
+  const body = await readJsonRequest(request);
+  const record = asRecord(body);
+  const source = validateAnnotationSource(cwd, allowedInputs, stringValue(record.source));
+  const kind = normalizeAnnotationKind(stringValue(record.kind));
+  const note = stringValue(record.note)?.trim();
+
+  if (!kind) {
+    throw new ValidationError("Annotation kind is unsupported.");
+  }
+
+  if (!note) {
+    throw new ValidationError("Annotation note is required.");
+  }
+
+  const updated = await updateManagedAnnotation(cwd, source, id, { kind, note });
+  const site = await refresh();
+  sendJson(response, 200, { annotation: updated, railHtml: railHtmlForSource(site, source) });
+}
+
+async function handleAnnotationDelete(
+  requestUrl: URL,
+  response: ServerResponse,
+  cwd: string,
+  allowedInputs: string[],
+  id: string,
+  refresh: () => Promise<AnnotationSite>,
+): Promise<void> {
+  if (!isSafeAnnotationId(id)) {
+    throw new ValidationError("Annotation id is invalid.");
+  }
+
+  const source = validateAnnotationSource(cwd, allowedInputs, requestUrl.searchParams.get("source") ?? undefined);
+  await deleteManagedAnnotation(cwd, source, id);
+  const site = await refresh();
+  sendJson(response, 200, { deleted: id, railHtml: railHtmlForSource(site, source) });
+}
+
+async function annotationFromRequest(
+  cwd: string,
+  allowedInputs: string[],
+  body: unknown,
+): Promise<SyncAnnotation> {
+  const record = asRecord(body);
+  const source = validateAnnotationSource(cwd, allowedInputs, stringValue(record.source));
+  const blockStartLine = integerValue(record.blockStartLine);
+  const blockEndLine = integerValue(record.blockEndLine);
+  const quote = stringValue(record.quote)?.trim();
+  const note = stringValue(record.note)?.trim();
+  const kind = normalizeAnnotationKind(stringValue(record.kind)) ?? "NOTE";
+
+  if (!blockStartLine || !blockEndLine || blockStartLine < 1 || blockEndLine < blockStartLine) {
+    throw new ValidationError("Annotation line range is invalid.");
+  }
+
+  if (!quote) {
+    throw new ValidationError("Annotation quote is required.");
+  }
+
+  if (!note) {
+    throw new ValidationError("Annotation note is required.");
+  }
+
+  const sourcePath = path.resolve(cwd, source);
+  const sourceMarkdown = await readFile(sourcePath, "utf8");
+  const document = splitLines(sourceMarkdown);
+  if (blockEndLine > document.lines.length) {
+    throw new ValidationError("Annotation line range is outside the source file.");
+  }
+
+  return {
+    id: `anno-${randomUUID()}`,
+    source,
+    blockStartLine,
+    blockEndLine,
+    quote,
+    note,
+    kind,
+  };
+}
+
+async function serveAnnotationAsset(
+  request: IncomingMessage,
+  response: ServerResponse,
+  site: AnnotationSite,
+): Promise<void> {
+  const requestUrl = new URL(request.url ?? "/", "http://localhost");
+  const pageName = decodeURIComponent(requestUrl.pathname.replace(/^\/+/, "")) || "index.html";
+
+  if (pageName === "style.css") {
+    sendText(response, 200, site.css, "text/css; charset=utf-8", request.method === "HEAD");
+    return;
+  }
+
+  if (pageName === ANNOTATION_SCRIPT_FILE) {
+    sendText(response, 200, ANNOTATION_JS, "text/javascript; charset=utf-8", request.method === "HEAD");
+    return;
+  }
+
+  if (pageName === MERMAID_INIT_FILE && site.hasMermaid) {
+    sendText(response, 200, MERMAID_INIT_JS, "text/javascript; charset=utf-8", request.method === "HEAD");
+    return;
+  }
+
+  if (pageName === MERMAID_BUNDLE_FILE && site.hasMermaid) {
+    const bundle = site.mermaidBundle ?? (await readFile(require.resolve("mermaid/dist/mermaid.min.js"), "utf8"));
+    site.mermaidBundle = bundle;
+    sendText(response, 200, bundle, "text/javascript; charset=utf-8", request.method === "HEAD");
+    return;
+  }
+
+  const html = site.pages.get(pageName);
+  if (html) {
+    sendText(response, 200, html, "text/html; charset=utf-8", request.method === "HEAD");
+    return;
+  }
+
+  sendText(response, 404, "Not found\n", "text/plain; charset=utf-8", request.method === "HEAD");
+}
+
+async function readJsonRequest(request: IncomingMessage): Promise<unknown> {
+  let source = "";
+
+  for await (const chunk of request) {
+    source += chunk;
+    if (source.length > 1_000_000) {
+      throw new ValidationError("Request body is too large.");
+    }
+  }
+
+  try {
+    return JSON.parse(source || "{}") as unknown;
+  } catch {
+    throw new ValidationError("Request body must be valid JSON.");
+  }
+}
+
+function sendJson(response: ServerResponse, statusCode: number, value: Record<string, unknown>): void {
+  const body = `${JSON.stringify(value)}\n`;
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+function sendText(
+  response: ServerResponse,
+  statusCode: number,
+  body: string,
+  contentType: string,
+  headOnly = false,
+): void {
+  response.writeHead(statusCode, {
+    "content-type": contentType,
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(headOnly ? undefined : body);
+}
+
+function listen(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+function hostForUrl(host: string): string {
+  if (host.includes(":") && !host.startsWith("[")) {
+    return `[${host}]`;
+  }
+
+  return host;
+}
+
+class ValidationError extends Error {}
+
+async function readAnnotationFile(annotationsPath: string): Promise<Record<string, unknown>> {
+  const source = await readFile(annotationsPath, "utf8");
+
+  try {
+    const parsed = JSON.parse(source) as unknown;
+    return asRecord(parsed);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to parse ${annotationsPath}: ${message}`);
+  }
+}
+
+function parseSyncAnnotations(
+  annotationFile: Record<string, unknown>,
+  annotationFileName: string,
+  warnings: string[],
+): SyncAnnotation[] {
+  if (!Array.isArray(annotationFile.annotations)) {
+    warnings.push(`${annotationFileName} does not contain an annotations array.`);
+    return [];
+  }
+
+  const annotations: SyncAnnotation[] = [];
+
+  annotationFile.annotations.forEach((value, index) => {
+    const annotation = asRecord(value);
+    const id = stringValue(annotation.id);
+    const source = stringValue(annotation.source);
+    const blockStartLine = integerValue(annotation.blockStartLine);
+    const blockEndLine = integerValue(annotation.blockEndLine);
+    const quote = stringValue(annotation.quote) ?? "";
+    const note = stringValue(annotation.note);
+    const kind = normalizeAnnotationKind(stringValue(annotation.kind)) ?? "NOTE";
+    const label = id ?? `at index ${index}`;
+
+    if (!id || !isSafeAnnotationId(id)) {
+      warnings.push(`Annotation ${label} has a missing or invalid id; skipped.`);
+      return;
+    }
+
+    if (!source) {
+      warnings.push(`Annotation ${id} is missing a source; skipped.`);
+      return;
+    }
+
+    if (!blockStartLine || !blockEndLine || blockStartLine < 1 || blockEndLine < blockStartLine) {
+      warnings.push(`Annotation ${id} has an invalid line range; skipped.`);
+      return;
+    }
+
+    if (!note || note.trim().length === 0) {
+      warnings.push(`Annotation ${id} has an empty note; skipped.`);
+      return;
+    }
+
+    annotations.push({
+      id,
+      source,
+      blockStartLine,
+      blockEndLine,
+      quote,
+      note,
+      kind,
+    });
+  });
+
+  return annotations;
+}
+
+async function syncAnnotationList(
+  cwd: string,
+  annotations: SyncAnnotation[],
+  dryRun: boolean,
+  result: CommandResult,
+): Promise<void> {
+  const annotationsBySource = new Map<string, SyncAnnotation[]>();
+  const seenAnnotationIds = new Set<string>();
+
+  for (const annotation of annotations) {
+    if (seenAnnotationIds.has(annotation.id)) {
+      result.warnings.push(`Annotation ${annotation.id} is duplicated; skipped.`);
+      continue;
+    }
+
+    seenAnnotationIds.add(annotation.id);
+    const sourcePath = path.resolve(cwd, annotation.source);
+    if (!isInsideProject(cwd, sourcePath)) {
+      result.warnings.push(`Annotation ${annotation.id} source "${annotation.source}" must be inside the project; skipped.`);
+      continue;
+    }
+
+    const source = relativePath(cwd, sourcePath);
+    annotationsBySource.set(source, [...(annotationsBySource.get(source) ?? []), annotation]);
+  }
+
+  for (const [source, sourceAnnotations] of annotationsBySource) {
+    await syncAnnotationsForSource(cwd, source, sourceAnnotations, dryRun, result);
+  }
+}
+
+async function syncAnnotationsForSource(
+  cwd: string,
+  source: string,
+  annotations: SyncAnnotation[],
+  dryRun: boolean,
+  result: CommandResult,
+): Promise<void> {
+  const sourcePath = path.join(cwd, source);
+  if (!(await pathExists(sourcePath))) {
+    for (const annotation of annotations) {
+      result.warnings.push(`${source}: annotation ${annotation.id} source file was not found; skipped.`);
+    }
+    return;
+  }
+
+  const original = await readFile(sourcePath, "utf8");
+  const document = splitLines(original);
+  const managedBlocks = managedAnnotationBlocks(document.lines);
+  const operations: FileSyncOperation[] = [];
+  let operationSequence = 0;
+
+  for (const annotation of annotations) {
+    if (!isValidAnnotationRange(annotation, document.lines.length)) {
+      result.warnings.push(
+        `${source}: annotation ${annotation.id} has invalid line range ${annotation.blockStartLine}-${annotation.blockEndLine}; skipped.`,
+      );
+      continue;
+    }
+
+    const replacementLines = renderAnnotationBlock(annotation);
+    const existingBlocks = managedBlocks.get(annotation.id) ?? [];
+
+    if (existingBlocks.length > 0) {
+      const [firstBlock, ...duplicateBlocks] = existingBlocks;
+      operations.push({
+        start: firstBlock.start,
+        deleteCount: firstBlock.end - firstBlock.start + 1,
+        lines: replacementLines,
+        sequence: operationSequence,
+      });
+      operationSequence += 1;
+
+      for (const duplicateBlock of duplicateBlocks) {
+        operations.push({
+          start: duplicateBlock.start,
+          deleteCount: duplicateBlock.end - duplicateBlock.start + 1,
+          lines: [],
+          sequence: operationSequence,
+        });
+        operationSequence += 1;
+      }
+    } else {
+      operations.push({
+        start: annotation.blockEndLine,
+        deleteCount: 0,
+        lines: replacementLines,
+        sequence: operationSequence,
+      });
+      operationSequence += 1;
+    }
+  }
+
+  if (operations.length === 0) {
+    return;
+  }
+
+  const nextLines = applyFileSyncOperations(document.lines, operations);
+  const nextSource = joinLines(nextLines, document.lineEnding, document.finalNewline);
+
+  if (nextSource === original) {
+    return;
+  }
+
+  if (!dryRun) {
+    await writeFile(sourcePath, nextSource, "utf8");
+  }
+  result.updated.push(source);
+}
+
+async function updateManagedAnnotation(
+  cwd: string,
+  source: string,
+  id: string,
+  updates: { kind: AnnotationKind; note: string },
+): Promise<RenderedAnnotation> {
+  const sourcePath = path.join(cwd, source);
+  const original = await readFile(sourcePath, "utf8");
+  const document = splitLines(original);
+  const block = managedAnnotationBlocks(document.lines).get(id)?.[0];
+
+  if (!block) {
+    throw new ValidationError("Annotation id was not found.");
+  }
+
+  const annotation: SyncAnnotation = {
+    id,
+    source,
+    blockStartLine: block.blockStartLine ?? block.start + 1,
+    blockEndLine: block.blockEndLine ?? block.start + 1,
+    quote: block.quote,
+    note: updates.note,
+    kind: updates.kind,
+  };
+  const nextLines = applyFileSyncOperations(document.lines, [
+    {
+      start: block.start,
+      deleteCount: block.end - block.start + 1,
+      lines: renderAnnotationBlock(annotation),
+      sequence: 0,
+    },
+  ]);
+
+  await writeFile(sourcePath, joinLines(nextLines, document.lineEnding, document.finalNewline), "utf8");
+  return annotation;
+}
+
+async function deleteManagedAnnotation(cwd: string, source: string, id: string): Promise<void> {
+  const sourcePath = path.join(cwd, source);
+  const original = await readFile(sourcePath, "utf8");
+  const document = splitLines(original);
+  const blocks = managedAnnotationBlocks(document.lines).get(id);
+
+  if (!blocks || blocks.length === 0) {
+    throw new ValidationError("Annotation id was not found.");
+  }
+
+  const operations = blocks.map((block, index) => ({
+    start: block.start,
+    deleteCount: block.end - block.start + 1,
+    lines: [],
+    sequence: index,
+  }));
+  const nextLines = applyFileSyncOperations(document.lines, operations);
+  await writeFile(sourcePath, joinLines(nextLines, document.lineEnding, document.finalNewline), "utf8");
+}
+
+function managedAnnotationBlocks(lines: string[]): Map<string, ManagedAnnotationBlock[]> {
+  const blocks = new Map<string, ManagedAnnotationBlock[]>();
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = parseAnnotationStartMarker(lines[index]);
+    if (!match) {
+      continue;
+    }
+
+    const end = lines.findIndex((line, lineIndex) => lineIndex > index && line === "<!-- mum-annotation:end -->");
+    if (end === -1) {
+      continue;
+    }
+
+    const block = annotationBlockFromLines(lines, index, end, match);
+    blocks.set(block.id, [...(blocks.get(block.id) ?? []), block]);
+    index = end;
+  }
+
+  return blocks;
+}
+
+function extractManagedAnnotations(markdown: string, source: string): { markdown: string; annotations: RenderedAnnotation[] } {
+  const document = splitLines(markdown);
+  const outputLines: string[] = [];
+  const annotations: RenderedAnnotation[] = [];
+
+  for (let index = 0; index < document.lines.length; index += 1) {
+    const marker = parseAnnotationStartMarker(document.lines[index]);
+    if (!marker) {
+      outputLines.push(document.lines[index]);
+      continue;
+    }
+
+    const end = document.lines.findIndex((line, lineIndex) => lineIndex > index && line === "<!-- mum-annotation:end -->");
+    if (end === -1) {
+      outputLines.push(document.lines[index]);
+      continue;
+    }
+
+    const block = annotationBlockFromLines(document.lines, index, end, marker);
+    annotations.push({
+      id: block.id,
+      source,
+      kind: block.kind,
+      blockStartLine: block.blockStartLine ?? index + 1,
+      blockEndLine: block.blockEndLine ?? index + 1,
+      quote: block.quote,
+      note: block.note,
+    });
+    index = end;
+  }
+
+  return {
+    markdown: joinLines(outputLines, document.lineEnding, document.finalNewline),
+    annotations,
+  };
+}
+
+function parseAnnotationStartMarker(line: string): { id: string; attrs: Map<string, string> } | undefined {
+  const match = line.match(/^<!-- mum-annotation:start\s+(.+) -->$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const attrs = new Map<string, string>();
+  for (const attrMatch of match[1].matchAll(/([a-z-]+)="([^"]*)"/g)) {
+    attrs.set(attrMatch[1], attrMatch[2]);
+  }
+
+  const id = attrs.get("id");
+  return id && isSafeAnnotationId(id) ? { id, attrs } : undefined;
+}
+
+function annotationBlockFromLines(
+  lines: string[],
+  start: number,
+  end: number,
+  marker: { id: string; attrs: Map<string, string> },
+): ManagedAnnotationBlock {
+  const body = lines.slice(start + 1, end);
+  const calloutKind = body[0]?.match(/^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/)?.[1];
+  const kind = normalizeAnnotationKind(marker.attrs.get("kind")) ?? normalizeAnnotationKind(calloutKind) ?? "NOTE";
+  const quoteLineIndex = body.findIndex((line) => line.startsWith("> Annotation on: "));
+  const quote = quoteLineIndex >= 0 ? parseAnnotationQuote(body[quoteLineIndex]) : "";
+  const noteStart = quoteLineIndex >= 0 ? quoteLineIndex + 1 : body[0]?.startsWith("> [!") ? 1 : 0;
+  const note = body
+    .slice(noteStart)
+    .map((line) => line.replace(/^> ?/, ""))
+    .join("\n")
+    .trim();
+  const blockStartLine = positiveInteger(marker.attrs.get("block-start"));
+  const blockEndLine = positiveInteger(marker.attrs.get("block-end"));
+
+  return {
+    id: marker.id,
+    kind,
+    blockStartLine,
+    blockEndLine,
+    quote,
+    note,
+    start,
+    end,
+  };
+}
+
+function parseAnnotationQuote(line: string): string {
+  const raw = line.replace(/^> Annotation on: /, "");
+  const match = raw.match(/^"([\s\S]*)"$/);
+  return match ? match[1] : raw;
+}
+
+function renderAnnotationBlock(annotation: SyncAnnotation): string[] {
+  return [
+    `<!-- mum-annotation:start id="${annotation.id}" kind="${annotation.kind}" block-start="${annotation.blockStartLine}" block-end="${annotation.blockEndLine}" -->`,
+    `> [!${annotation.kind}]`,
+    `> Annotation on: "${annotation.quote.replaceAll("\n", " ")}"`,
+    ...annotation.note.split(/\r?\n/).map((line) => (line.length > 0 ? `> ${line}` : ">")),
+    "<!-- mum-annotation:end -->",
+  ];
+}
+
+function applyFileSyncOperations(lines: string[], operations: FileSyncOperation[]): string[] {
+  const nextLines = [...lines];
+  const sortedOperations = [...operations].sort(
+    (a, b) => b.start - a.start || b.sequence - a.sequence || b.deleteCount - a.deleteCount,
+  );
+
+  for (const operation of sortedOperations) {
+    nextLines.splice(operation.start, operation.deleteCount, ...operation.lines);
+  }
+
+  return nextLines;
+}
+
+function splitLines(source: string): { lines: string[]; lineEnding: "\n" | "\r\n"; finalNewline: boolean } {
+  const lineEnding = source.includes("\r\n") ? "\r\n" : "\n";
+  const normalized = source.replace(/\r\n/g, "\n");
+  const finalNewline = normalized.endsWith("\n");
+  const content = finalNewline ? normalized.slice(0, -1) : normalized;
+  return {
+    lines: content.length === 0 ? [] : content.split("\n"),
+    lineEnding,
+    finalNewline,
+  };
+}
+
+function hideManagedAnnotationMarkers(markdown: string): string {
+  return extractManagedAnnotations(markdown, "").markdown;
+}
+
+function joinLines(lines: string[], lineEnding: "\n" | "\r\n", finalNewline: boolean): string {
+  const source = lines.join(lineEnding);
+  return finalNewline ? `${source}${lineEnding}` : source;
+}
+
+function isValidAnnotationRange(annotation: SyncAnnotation, lineCount: number): boolean {
+  return annotation.blockStartLine >= 1 && annotation.blockEndLine >= annotation.blockStartLine && annotation.blockEndLine <= lineCount;
+}
+
+function isSafeAnnotationId(id: string): boolean {
+  return id.length > 0 && !/["<>\r\n]/.test(id);
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function integerValue(value: unknown): number | undefined {
+  return Number.isInteger(value) ? (value as number) : undefined;
+}
+
+function positiveInteger(value: string | undefined): number | undefined {
+  if (!value || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function normalizeAnnotationKind(value: string | undefined): AnnotationKind | undefined {
+  const upper = value?.toUpperCase();
+  return SUPPORTED_ANNOTATION_KINDS.includes(upper as AnnotationKind) ? (upper as AnnotationKind) : undefined;
+}
+
+function validateAnnotationSource(cwd: string, allowedInputs: string[], source: string | undefined): string {
+  if (!source) {
+    throw new ValidationError("Annotation source is required.");
+  }
+
+  const sourcePath = path.resolve(cwd, source);
+  if (!isInsideProject(cwd, sourcePath)) {
+    throw new ValidationError("Annotation source must be inside the project.");
+  }
+
+  const relativeSource = relativePath(cwd, sourcePath);
+  if (!allowedInputs.includes(relativeSource)) {
+    throw new ValidationError("Annotation source is not part of this annotation session.");
+  }
+
+  return relativeSource;
 }
 
 async function loadDesign(cwd: string, warnings: string[]): Promise<DesignTokens> {
@@ -406,6 +1666,17 @@ function mergeDesignTokens(data: Record<string, unknown>): DesignTokens {
       lg: stringToken(spacing.lg, BUILT_IN_DESIGN.spacing.lg),
       xl: stringToken(spacing.xl, BUILT_IN_DESIGN.spacing.xl),
     },
+  };
+}
+
+async function resolveMarkdownInputs(
+  cwd: string,
+  inputs: string[] | undefined,
+): Promise<{ inputs: string[]; hasExplicitInputs: boolean }> {
+  const hasExplicitInputs = (inputs?.length ?? 0) > 0;
+  return {
+    inputs: hasExplicitInputs ? await validateExplicitMarkdownInputs(cwd, inputs ?? []) : await discoverMarkdownInputs(cwd),
+    hasExplicitInputs,
   };
 }
 
@@ -481,9 +1752,11 @@ async function renderMarkdownFile(
   inputName: string,
   outputName: string,
   warnings: string[],
+  options: { annotationSource?: string } = {},
 ): Promise<RenderedMarkdownFile> {
-  const md = createMarkdownIt();
-  const tokens = md.parse(markdown, {});
+  const md = createMarkdownIt(options);
+  const extracted = extractManagedAnnotations(markdown, inputName);
+  const tokens = md.parse(extracted.markdown, {});
   const hasMermaid = hasMermaidDiagram(tokens);
   await embedLocalImages(tokens, path.dirname(inputPath), inputName, warnings);
   const body = md.renderer.render(tokens, md.options, {});
@@ -492,41 +1765,54 @@ async function renderMarkdownFile(
     title,
     body,
     stylesheetHrefForOutput(outputName),
-    scriptHrefsForOutput(outputName, hasMermaid),
+    scriptHrefsForOutput(outputName, hasMermaid, Boolean(options.annotationSource)),
+    Boolean(options.annotationSource),
+    extracted.annotations,
   );
-  return { html, hasMermaid };
+  return { html, hasMermaid, annotations: extracted.annotations };
 }
 
-function createMarkdownIt(): MarkdownIt {
+function createMarkdownIt(options: { annotationSource?: string } = {}): MarkdownIt {
   const md = new MarkdownIt({
     html: false,
     linkify: true,
     typographer: false,
   }).use(markdownItTaskLists);
 
+  const annotationSource = options.annotationSource;
+
   addClassRule(md, "heading_open", (token) => {
     const level = token.tag.replace(/^h/i, "");
     return `mum-heading mum-h${level}`;
-  });
-  addClassRule(md, "paragraph_open", "mum-paragraph");
+  }, annotationSource);
+  addClassRule(md, "paragraph_open", "mum-paragraph", annotationSource);
   addClassRule(md, "link_open", "mum-link");
-  addClassRule(md, "bullet_list_open", (token) =>
-    hasClass(token, "contains-task-list") ? "mum-list mum-ul mum-task-list" : "mum-list mum-ul",
+  addClassRule(
+    md,
+    "bullet_list_open",
+    (token) => (hasClass(token, "contains-task-list") ? "mum-list mum-ul mum-task-list" : "mum-list mum-ul"),
+    annotationSource,
   );
-  addClassRule(md, "ordered_list_open", (token) =>
-    hasClass(token, "contains-task-list") ? "mum-list mum-ol mum-task-list" : "mum-list mum-ol",
+  addClassRule(
+    md,
+    "ordered_list_open",
+    (token) => (hasClass(token, "contains-task-list") ? "mum-list mum-ol mum-task-list" : "mum-list mum-ol"),
+    annotationSource,
   );
-  addClassRule(md, "list_item_open", (token) =>
-    hasClass(token, "task-list-item") ? "mum-list-item mum-task-list-item" : "mum-list-item",
+  addClassRule(
+    md,
+    "list_item_open",
+    (token) => (hasClass(token, "task-list-item") ? "mum-list-item mum-task-list-item" : "mum-list-item"),
+    annotationSource,
   );
-  addClassRule(md, "blockquote_open", "mum-blockquote");
-  addClassRule(md, "table_open", "mum-table");
+  addClassRule(md, "blockquote_open", "mum-blockquote", annotationSource);
+  addClassRule(md, "table_open", "mum-table", annotationSource);
   addClassRule(md, "thead_open", "mum-table-head");
   addClassRule(md, "tbody_open", "mum-table-body");
   addClassRule(md, "tr_open", "mum-table-row");
   addClassRule(md, "th_open", "mum-table-cell mum-table-header");
   addClassRule(md, "td_open", "mum-table-cell");
-  addClassRule(md, "hr", "mum-hr");
+  addClassRule(md, "hr", "mum-hr", annotationSource);
   addClassRule(md, "s_open", "mum-strikethrough");
 
   md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
@@ -544,18 +1830,18 @@ function createMarkdownIt(): MarkdownIt {
   };
 
   md.renderer.rules.code_block = (tokens, idx) => {
-    return `<pre class="mum-code-block"><code class="mum-code mum-code-block-code">${escapeHtml(tokens[idx].content)}</code></pre>\n`;
+    return `<pre class="mum-code-block"${annotationDataAttrs(tokens[idx], annotationSource)}><code class="mum-code mum-code-block-code">${escapeHtml(tokens[idx].content)}</code></pre>\n`;
   };
 
   md.renderer.rules.fence = (tokens, idx) => {
     const token = tokens[idx];
     const langName = token.info.trim().split(/\s+/)[0] ?? "";
     if (isMermaidFenceInfo(token.info)) {
-      return `<pre class="mum-mermaid mermaid">${escapeHtml(token.content)}</pre>\n`;
+      return `<pre class="mum-mermaid mermaid"${annotationDataAttrs(token, annotationSource)}>${escapeHtml(token.content)}</pre>\n`;
     }
 
     const languageClass = langName ? ` language-${escapeHtmlAttribute(langName)}` : "";
-    return `<pre class="mum-code-block"><code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
+    return `<pre class="mum-code-block"${annotationDataAttrs(token, annotationSource)}><code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
   };
 
   md.renderer.rules.html_inline = (tokens, idx) => {
@@ -634,11 +1920,30 @@ async function embedImageToken(
   }
 }
 
-function renderDocument(title: string, body: string, stylesheetHref: string, scriptHrefs: string[] = []): string {
+function renderDocument(
+  title: string,
+  body: string,
+  stylesheetHref: string,
+  scriptHrefs: string[] = [],
+  includeAnnotationControls = false,
+  annotations: RenderedAnnotation[] = [],
+): string {
   const scripts = scriptHrefs
     .map((scriptHref) => `<script defer src="${escapeHtmlAttribute(scriptHref)}"></script>`)
     .join("\n");
   const scriptBlock = scripts ? `\n${scripts}` : "";
+  const annotationControls = includeAnnotationControls ? renderAnnotationControls() : "";
+  const annotationRail = annotations.length > 0 || includeAnnotationControls
+    ? renderAnnotationRail(annotations, includeAnnotationControls)
+    : "";
+  const content = annotationRail
+    ? `<div class="mum-page mum-page-with-annotations">
+<main class="mum-document">
+${body}</main>
+${annotationRail}
+</div>`
+    : `<main class="mum-document">
+${body}</main>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -651,11 +1956,77 @@ function renderDocument(title: string, body: string, stylesheetHref: string, scr
 <link rel="stylesheet" href="${escapeHtmlAttribute(stylesheetHref)}">${scriptBlock}
 </head>
 <body>
-<main class="mum-document">
-${body}</main>
+${content}${annotationControls}
 </body>
 </html>
 `;
+}
+
+function renderAnnotationControls(): string {
+  return `
+<button type="button" class="mum-annotation-button" hidden>Add annotation</button>
+<dialog class="mum-annotation-dialog" closedby="any" aria-labelledby="mum-annotation-title">
+<form class="mum-annotation-form">
+<h2 class="mum-annotation-title" id="mum-annotation-title">Add annotation</h2>
+<blockquote class="mum-annotation-quote"></blockquote>
+<label class="mum-annotation-label" for="mum-annotation-kind">Kind
+<select class="mum-annotation-kind" id="mum-annotation-kind">
+${SUPPORTED_ANNOTATION_KINDS.map((kind) => `<option value="${kind}">${kind}</option>`).join("\n")}
+</select>
+</label>
+<label class="mum-annotation-label" for="mum-annotation-note">Note
+<textarea class="mum-annotation-note" id="mum-annotation-note" required></textarea>
+</label>
+<div class="mum-annotation-actions">
+<button type="button" class="mum-annotation-cancel">Cancel</button>
+<button type="submit">Save</button>
+</div>
+</form>
+</dialog>
+<p class="mum-annotation-status" role="status" aria-live="polite"></p>`;
+}
+
+function renderAnnotationRail(annotations: RenderedAnnotation[], editable: boolean): string {
+  return `<aside class="mum-annotation-rail" aria-labelledby="mum-annotation-rail-title" data-mum-annotation-rail>
+${renderAnnotationRailContents(annotations, editable)}
+</aside>`;
+}
+
+function renderAnnotationRailContents(annotations: RenderedAnnotation[], editable: boolean): string {
+  const emptyState = annotations.length === 0
+    ? '<p class="mum-annotation-empty">No annotations yet.</p>'
+    : "";
+  const items = annotations.length > 0
+    ? `<ol class="mum-annotation-list">
+${annotations.map((annotation) => renderAnnotationCard(annotation, editable)).join("\n")}
+</ol>`
+    : "";
+
+  return `<h2 class="mum-annotation-rail-title" id="mum-annotation-rail-title">Annotations</h2>
+${emptyState}${items}`;
+}
+
+function renderAnnotationCard(annotation: RenderedAnnotation, editable: boolean): string {
+  const range = annotation.blockStartLine === annotation.blockEndLine
+    ? `Line ${annotation.blockStartLine}`
+    : `Lines ${annotation.blockStartLine}-${annotation.blockEndLine}`;
+  const actions = editable
+    ? `<div class="mum-annotation-card-actions">
+<button type="button" data-mum-annotation-action="edit">Edit<span class="mum-visually-hidden"> annotation ${escapeHtml(annotation.id)}</span></button>
+<button type="button" data-mum-annotation-action="delete">Delete<span class="mum-visually-hidden"> annotation ${escapeHtml(annotation.id)}</span></button>
+</div>`
+    : "";
+
+  return `<li class="mum-annotation-card" data-mum-annotation-id="${escapeHtmlAttribute(annotation.id)}" data-mum-source="${escapeHtmlAttribute(annotation.source)}" data-mum-kind="${annotation.kind}" data-mum-quote="${escapeHtmlAttribute(annotation.quote)}" data-mum-note="${escapeHtmlAttribute(annotation.note)}">
+<p class="mum-annotation-card-meta"><span class="mum-annotation-kind-badge">${annotation.kind}</span><span>${escapeHtml(range)}</span></p>
+<blockquote class="mum-annotation-card-quote">${escapeHtml(annotation.quote)}</blockquote>
+<p class="mum-annotation-card-note">${escapeHtml(annotation.note).replaceAll("\n", "<br>")}</p>
+${actions}
+</li>`;
+}
+
+function railHtmlForSource(site: AnnotationSite, source: string): string {
+  return renderAnnotationRailContents(site.annotationsBySource.get(source) ?? [], true);
 }
 
 async function writeStylesheet(outputDir: string, design: DesignTokens): Promise<string> {
@@ -893,6 +2264,105 @@ body {
   box-shadow: var(--mum-document-shadow);
 }
 
+.mum-page {
+  width: min(100% - 32px, 1280px);
+  margin: var(--mum-space-xl) auto;
+}
+
+.mum-page-with-annotations {
+  display: grid;
+  grid-template-columns: minmax(0, 920px) minmax(260px, 320px);
+  gap: var(--mum-space-lg);
+  align-items: start;
+  justify-content: center;
+}
+
+.mum-page-with-annotations .mum-document {
+  width: 100%;
+  margin: 0;
+}
+
+.mum-annotation-rail {
+  position: sticky;
+  top: var(--mum-space-lg);
+  max-height: calc(100vh - (var(--mum-space-lg) * 2));
+  overflow: auto;
+  padding: var(--mum-space-md);
+  background: var(--mum-surface);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-md);
+}
+
+.mum-annotation-rail-title {
+  margin: 0 0 var(--mum-space-md);
+  font-size: 1rem;
+  line-height: 1.25;
+}
+
+.mum-annotation-empty {
+  margin: 0;
+  color: var(--mum-muted);
+}
+
+.mum-annotation-list {
+  display: grid;
+  gap: var(--mum-space-md);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mum-annotation-card {
+  padding: var(--mum-space-md);
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  background: var(--mum-code-background);
+}
+
+.mum-annotation-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--mum-space-sm);
+  align-items: center;
+  margin: 0 0 var(--mum-space-sm);
+  color: var(--mum-muted);
+  font-size: 0.875rem;
+}
+
+.mum-annotation-kind-badge {
+  border: 1px solid var(--mum-border);
+  border-radius: var(--mum-radius-sm);
+  padding: 0.05rem 0.35rem;
+  background: var(--mum-surface);
+  color: var(--mum-text);
+  font-weight: 700;
+}
+
+.mum-annotation-card-quote {
+  margin: 0 0 var(--mum-space-sm);
+  padding-left: var(--mum-space-sm);
+  border-left: 3px solid var(--mum-primary);
+  color: var(--mum-muted);
+  font-size: 0.9375rem;
+}
+
+.mum-annotation-card-note {
+  margin: 0;
+  color: var(--mum-text);
+}
+
+.mum-visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
 .mum-document > :first-child {
   margin-top: 0;
 }
@@ -1058,6 +2528,15 @@ body {
 }
 
 @media (max-width: 640px) {
+  .mum-page {
+    width: 100%;
+    margin: 0;
+  }
+
+  .mum-page-with-annotations {
+    display: block;
+  }
+
   .mum-document {
     width: 100%;
     margin: 0;
@@ -1067,22 +2546,56 @@ body {
     border-radius: 0;
     box-shadow: none;
   }
+
+  .mum-annotation-rail {
+    position: static;
+    max-height: none;
+    margin: var(--mum-space-md);
+  }
 }`;
 }
 
-function addClassRule(md: MarkdownIt, tokenType: string, className: string | ((token: MarkdownToken) => string)): void {
+function addClassRule(
+  md: MarkdownIt,
+  tokenType: string,
+  className: string | ((token: MarkdownToken) => string),
+  annotationSource?: string,
+): void {
   const defaultRender =
     md.renderer.rules[tokenType] ??
     ((tokens, idx, options, _env, renderer) => renderer.renderToken(tokens, idx, options));
 
   md.renderer.rules[tokenType] = (tokens, idx, options, env, renderer) => {
     addClass(tokens[idx], typeof className === "function" ? className(tokens[idx]) : className);
+    addAnnotationDataAttrs(tokens[idx], annotationSource);
     return defaultRender(tokens, idx, options, env, renderer);
   };
 }
 
 function addClass(token: MarkdownToken, className: string): void {
   token.attrJoin("class", className);
+}
+
+function addAnnotationDataAttrs(token: MarkdownToken, annotationSource: string | undefined): void {
+  if (!annotationSource || !token.map) {
+    return;
+  }
+
+  token.attrSet("data-mum-source", annotationSource);
+  token.attrSet("data-mum-line-start", String(token.map[0] + 1));
+  token.attrSet("data-mum-line-end", String(token.map[1]));
+}
+
+function annotationDataAttrs(token: MarkdownToken, annotationSource: string | undefined): string {
+  if (!annotationSource || !token.map) {
+    return "";
+  }
+
+  return [
+    ` data-mum-source="${escapeHtmlAttribute(annotationSource)}"`,
+    ` data-mum-line-start="${token.map[0] + 1}"`,
+    ` data-mum-line-end="${token.map[1]}"`,
+  ].join("");
 }
 
 function hasClass(token: MarkdownToken, className: string): boolean {
@@ -1154,12 +2667,11 @@ function stylesheetHrefForOutput(outputName: string): string {
   return assetHrefForOutput(outputName, "style.css");
 }
 
-function scriptHrefsForOutput(outputName: string, includeMermaid: boolean): string[] {
-  if (!includeMermaid) {
-    return [];
-  }
-
-  return MERMAID_ASSET_FILES.map((assetName) => assetHrefForOutput(outputName, assetName));
+function scriptHrefsForOutput(outputName: string, includeMermaid: boolean, includeAnnotations = false): string[] {
+  return [
+    ...(includeMermaid ? MERMAID_ASSET_FILES.map((assetName) => assetHrefForOutput(outputName, assetName)) : []),
+    ...(includeAnnotations ? [assetHrefForOutput(outputName, ANNOTATION_SCRIPT_FILE)] : []),
+  ];
 }
 
 function assetHrefForOutput(outputName: string, assetName: string): string {

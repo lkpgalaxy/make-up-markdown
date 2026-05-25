@@ -9,6 +9,8 @@ import {
   initProject,
   makeUpMarkdown,
   renderProject,
+  startAnnotationServer,
+  syncAnnotations,
 } from "../src/index.js";
 
 describe("initProject", () => {
@@ -87,7 +89,370 @@ describe("initProject", () => {
   });
 });
 
+describe("syncAnnotations", () => {
+  it("inserts a managed callout after the annotated Markdown block", async () => {
+    const cwd = await tempProject();
+    await mkdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
+    await writeFile(path.join(cwd, "README.md"), "# Title\n\nParagraph one.\nParagraph two.\n\nTail.\n", "utf8");
+    await writeFile(
+      path.join(cwd, DEFAULT_OUTPUT_DIR, "annotations.json"),
+      JSON.stringify({
+        version: 1,
+        annotations: [
+          {
+            id: "anno-1",
+            source: "README.md",
+            blockStartLine: 3,
+            blockEndLine: 4,
+            quote: "Paragraph one. Paragraph two.",
+            note: "User note",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await syncAnnotations({ cwd });
+    const markdown = await readFile(path.join(cwd, "README.md"), "utf8");
+
+    expect(result.updated).toEqual(["README.md"]);
+    expect(result.warnings).toEqual([]);
+    expect(markdown).toBe(`# Title
+
+Paragraph one.
+Paragraph two.
+<!-- mum-annotation:start id="anno-1" kind="NOTE" block-start="3" block-end="4" -->
+> [!NOTE]
+> Annotation on: "Paragraph one. Paragraph two."
+> User note
+<!-- mum-annotation:end -->
+
+Tail.
+`);
+  });
+
+  it("updates an existing managed annotation instead of duplicating it", async () => {
+    const cwd = await tempProject();
+    await mkdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
+    await writeFile(
+      path.join(cwd, "README.md"),
+      `# Title
+
+Paragraph.
+<!-- mum-annotation:start id="anno-1" -->
+> [!NOTE]
+> Annotation on: "old"
+> Old note
+<!-- mum-annotation:end -->
+`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(cwd, DEFAULT_OUTPUT_DIR, "annotations.json"),
+      JSON.stringify({
+        version: 1,
+        annotations: [
+          {
+            id: "anno-1",
+            source: "README.md",
+            blockStartLine: 3,
+            blockEndLine: 3,
+            quote: "Paragraph.",
+            note: "Updated note",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await syncAnnotations({ cwd });
+    const markdown = await readFile(path.join(cwd, "README.md"), "utf8");
+    const second = await syncAnnotations({ cwd });
+    const markdownAgain = await readFile(path.join(cwd, "README.md"), "utf8");
+
+    expect(result.updated).toEqual(["README.md"]);
+    expect(second.updated).toEqual([]);
+    expect(markdownAgain).toBe(markdown);
+    expect(markdown.match(/mum-annotation:start/g)).toHaveLength(1);
+    expect(markdown).toContain('> Annotation on: "Paragraph."');
+    expect(markdown).toContain("> Updated note");
+    expect(markdown).not.toContain("Old note");
+  });
+
+  it("reports dry-run updates without writing Markdown", async () => {
+    const cwd = await tempProject();
+    await mkdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
+    const originalMarkdown = "# Title\n\nParagraph.\n";
+    await writeFile(path.join(cwd, "README.md"), originalMarkdown, "utf8");
+    await writeFile(
+      path.join(cwd, DEFAULT_OUTPUT_DIR, "annotations.json"),
+      JSON.stringify({
+        version: 1,
+        annotations: [
+          {
+            id: "anno-1",
+            source: "README.md",
+            blockStartLine: 3,
+            blockEndLine: 3,
+            quote: "Paragraph.",
+            note: "Dry note",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await syncAnnotations({ cwd, dryRun: true });
+
+    expect(result.updated).toEqual(["README.md"]);
+    await expect(readFile(path.join(cwd, "README.md"), "utf8")).resolves.toBe(originalMarkdown);
+  });
+
+  it("warns and skips missing inputs, invalid line ranges, and empty notes", async () => {
+    const missingAnnotations = await tempProject();
+
+    await expect(syncAnnotations({ cwd: missingAnnotations })).resolves.toMatchObject({
+      warnings: [".make-up-markdown/annotations.json was not found; no annotations were synced."],
+    });
+
+    const cwd = await tempProject();
+    await mkdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
+    await writeFile(path.join(cwd, "README.md"), "# Title\n", "utf8");
+    await writeFile(
+      path.join(cwd, DEFAULT_OUTPUT_DIR, "annotations.json"),
+      JSON.stringify({
+        version: 1,
+        annotations: [
+          {
+            id: "missing-source",
+            blockStartLine: 1,
+            blockEndLine: 1,
+            quote: "Title",
+            note: "No source",
+          },
+          {
+            id: "missing-file",
+            source: "missing.md",
+            blockStartLine: 1,
+            blockEndLine: 1,
+            quote: "Missing",
+            note: "No file",
+          },
+          {
+            id: "bad-range",
+            source: "README.md",
+            blockStartLine: 1,
+            blockEndLine: 4,
+            quote: "Title",
+            note: "Out of bounds",
+          },
+          {
+            id: "empty-note",
+            source: "README.md",
+            blockStartLine: 1,
+            blockEndLine: 1,
+            quote: "Title",
+            note: "",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = await syncAnnotations({ cwd });
+
+    expect(result.updated).toEqual([]);
+    expect(result.warnings).toEqual([
+      "Annotation missing-source is missing a source; skipped.",
+      "Annotation empty-note has an empty note; skipped.",
+      "missing.md: annotation missing-file source file was not found; skipped.",
+      "README.md: annotation bad-range has invalid line range 1-4; skipped.",
+    ]);
+    await expect(readFile(path.join(cwd, "README.md"), "utf8")).resolves.toBe("# Title\n");
+  });
+});
+
+describe("startAnnotationServer", () => {
+  it("serves annotation-enabled pages with source metadata and annotation assets", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await writeFile(path.join(cwd, "README.md"), "# Title\n\nParagraph one.\n", "utf8");
+
+    const server = await startAnnotationServer({ cwd, inputs: ["README.md"], port: 0 });
+    try {
+      const html = await fetchText(new URL("README.html", server.url));
+      const css = await fetchText(new URL("style.css", server.url));
+      const script = await fetchText(new URL("mum-annotate.js", server.url));
+
+      expect(html).toContain('<script defer src="mum-annotate.js"></script>');
+      expect(html).toContain('class="mum-annotation-button" hidden');
+      expect(html).toContain('data-mum-source="README.md"');
+      expect(html).toContain('data-mum-line-start="3"');
+      expect(html).toContain('data-mum-line-end="3"');
+      expect(html).toContain("<dialog");
+      expect(html).toContain('data-mum-annotation-rail');
+      expect(html).toContain("No annotations yet.");
+      expect(css).toContain(".mum-annotation-button");
+      expect(css).toContain(".mum-annotation-card-actions");
+      expect(script).toContain('method: editingAnnotation ? "PATCH" : "POST"');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("posts annotations into Markdown, refreshes served HTML, and rejects invalid saves without edits", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    const originalMarkdown = "# Title\n\nParagraph one.\n\nTail.\n";
+    await writeFile(path.join(cwd, "README.md"), originalMarkdown, "utf8");
+
+    const server = await startAnnotationServer({ cwd, inputs: ["README.md"], port: 0 });
+    try {
+      for (const body of [
+        { source: "../outside.md", blockStartLine: 3, blockEndLine: 3, quote: "Paragraph one.", note: "Nope" },
+        { source: "README.md", blockStartLine: 9, blockEndLine: 9, quote: "Paragraph one.", note: "Nope" },
+        { source: "README.md", blockStartLine: 3, blockEndLine: 3, quote: "", note: "Nope" },
+        { source: "README.md", blockStartLine: 3, blockEndLine: 3, quote: "Paragraph one.", note: "" },
+      ]) {
+        const response = await postJson(new URL("api/annotations", server.url), body);
+        expect(response.status).toBe(400);
+      }
+
+      await expect(readFile(path.join(cwd, "README.md"), "utf8")).resolves.toBe(originalMarkdown);
+
+      const response = await postJson(new URL("api/annotations", server.url), {
+        source: "README.md",
+        blockStartLine: 3,
+        blockEndLine: 3,
+        quote: "Paragraph one.",
+        note: "Browser note",
+        kind: "WARNING",
+      });
+      const payload = (await response.json()) as { annotation: { id: string }; railHtml: string };
+      const markdown = await readFile(path.join(cwd, "README.md"), "utf8");
+      const refreshedHtml = await fetchText(new URL("README.html", server.url));
+
+      expect(response.status).toBe(201);
+      expect(payload.annotation.id).toMatch(/^anno-/);
+      expect(markdown).toContain(`<!-- mum-annotation:start id="${payload.annotation.id}" kind="WARNING" block-start="3" block-end="3" -->`);
+      expect(markdown).toContain("> [!WARNING]");
+      expect(markdown).toContain('> Annotation on: "Paragraph one."');
+      expect(markdown).toContain("> Browser note");
+      expect(payload.railHtml).toContain("Browser note");
+      expect(payload.railHtml).toContain("WARNING");
+      expect(refreshedHtml).toContain("Browser note");
+      expect(refreshedHtml).toContain("mum-annotation-card");
+      expect(refreshedHtml).not.toContain("mum-annotation:start");
+      expect(refreshedHtml).not.toContain("mum-annotation:end");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("patches and deletes existing annotations while validating source, id, kind, and note", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await writeFile(
+      path.join(cwd, "README.md"),
+      `# Title
+
+Paragraph one.
+<!-- mum-annotation:start id="anno-1" -->
+> [!NOTE]
+> Annotation on: "Paragraph one."
+> Browser note
+<!-- mum-annotation:end -->
+
+Tail.
+`,
+      "utf8",
+    );
+
+    const server = await startAnnotationServer({ cwd, inputs: ["README.md"], port: 0 });
+    try {
+      for (const { url, body } of [
+        { url: new URL("api/annotations/missing", server.url), body: { source: "README.md", kind: "TIP", note: "Nope" } },
+        { url: new URL("api/annotations/anno-1", server.url), body: { source: "../outside.md", kind: "TIP", note: "Nope" } },
+        { url: new URL("api/annotations/anno-1", server.url), body: { source: "README.md", kind: "BAD", note: "Nope" } },
+        { url: new URL("api/annotations/anno-1", server.url), body: { source: "README.md", kind: "TIP", note: "" } },
+      ]) {
+        const response = await patchJson(url, body);
+        expect(response.status).toBe(400);
+      }
+
+      const patchResponse = await patchJson(new URL("api/annotations/anno-1", server.url), {
+        source: "README.md",
+        kind: "TIP",
+        note: "Updated note",
+      });
+      const patchPayload = (await patchResponse.json()) as { railHtml: string };
+      let markdown = await readFile(path.join(cwd, "README.md"), "utf8");
+
+      expect(patchResponse.status).toBe(200);
+      expect(markdown).toContain('<!-- mum-annotation:start id="anno-1" kind="TIP" block-start="4" block-end="4" -->');
+      expect(markdown).toContain("> [!TIP]");
+      expect(markdown).toContain('> Annotation on: "Paragraph one."');
+      expect(markdown).toContain("> Updated note");
+      expect(markdown).not.toContain("Browser note");
+      expect(patchPayload.railHtml).toContain("Updated note");
+      expect(patchPayload.railHtml).toContain("TIP");
+
+      const invalidDelete = await fetch(new URL("api/annotations/anno-1?source=missing.md", server.url), {
+        method: "DELETE",
+      });
+      expect(invalidDelete.status).toBe(400);
+
+      const deleteResponse = await fetch(new URL("api/annotations/anno-1?source=README.md", server.url), {
+        method: "DELETE",
+      });
+      const deletePayload = (await deleteResponse.json()) as { railHtml: string };
+      markdown = await readFile(path.join(cwd, "README.md"), "utf8");
+
+      expect(deleteResponse.status).toBe(200);
+      expect(markdown).not.toContain("mum-annotation:start");
+      expect(markdown).not.toContain("Updated note");
+      expect(deletePayload.railHtml).toContain("No annotations yet.");
+    } finally {
+      await server.close();
+    }
+  });
+});
+
 describe("renderProject", () => {
+  it("renders managed annotations in a read-only right rail without inline callouts", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await writeFile(
+      path.join(cwd, "README.md"),
+      `# Project
+
+Paragraph one.
+<!-- mum-annotation:start id="anno-1" kind="CAUTION" block-start="3" block-end="3" -->
+> [!CAUTION]
+> Annotation on: "Paragraph one."
+> Static note
+<!-- mum-annotation:end -->
+
+Tail.
+`,
+      "utf8",
+    );
+
+    await renderProject({ cwd, inputs: ["README.md"] });
+    const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+
+    expect(html).toContain('data-mum-annotation-rail');
+    expect(html).toContain("mum-annotation-card");
+    expect(html).toContain("CAUTION");
+    expect(html).toContain("Static note");
+    expect(html).toContain("Line 3");
+    expect(html).not.toContain("mum-annotation-card-actions");
+    expect(html).not.toContain("Edit annotation");
+    expect(html).not.toContain("Delete annotation");
+    expect(html).not.toContain("mum-annotation:start");
+    expect(html).not.toContain("[!CAUTION]");
+  });
+
   it("renders visible Markdown files recursively by default without modifying them and refreshes stale output", async () => {
     const cwd = await tempProject();
     await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
@@ -134,6 +499,8 @@ describe("renderProject", () => {
     expect(html).toContain('<meta name="color-scheme" content="light dark">');
     expect(html).toContain('<a href="docs/guide.md" class="mum-link">guide</a>');
     expect(html).toContain('<img src="https://example.com/image.png" alt="remote" class="mum-image">');
+    expect(html).not.toContain("mum-annotation-button");
+    expect(html).not.toContain("data-mum-source");
     expect(html).not.toContain("<style>");
     expect(index).toContain('<link rel="stylesheet" href="style.css">');
     expect(index).toContain('<meta name="color-scheme" content="light dark">');
@@ -469,6 +836,23 @@ const value = 1;
     expect(html).toContain('<hr class="mum-hr">');
   });
 
+  it("hides managed annotation blocks from rendered Markdown fragments", () => {
+    const html = makeUpMarkdown(`Paragraph.
+
+<!-- mum-annotation:start id="anno-1" -->
+> [!NOTE]
+> Annotation on: "Paragraph."
+> Browser note
+<!-- mum-annotation:end -->
+`);
+
+    expect(html).toContain('<p class="mum-paragraph">Paragraph.</p>');
+    expect(html).not.toContain('<blockquote class="mum-blockquote">');
+    expect(html).not.toContain("Browser note");
+    expect(html).not.toContain("mum-annotation:start");
+    expect(html).not.toContain("mum-annotation:end");
+  });
+
   it("renders Mermaid fences as browser-renderable diagram containers", () => {
     const sequenceHtml = makeUpMarkdown("```mermaid\n%% comment\n\nsequenceDiagram\nAlice->>Bob: <hello & goodbye>\n```\n");
     const flowchartHtml = makeUpMarkdown("```mermaid\nflowchart TD\nA-->B\n```\n");
@@ -561,4 +945,26 @@ async function tempProject(): Promise<string> {
 
 function tinyPng(): string {
   return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+}
+
+async function fetchText(url: URL): Promise<string> {
+  const response = await fetch(url);
+  expect(response.status).toBe(200);
+  return response.text();
+}
+
+function postJson(url: URL, body: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+function patchJson(url: URL, body: unknown): Promise<Response> {
+  return fetch(url, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
