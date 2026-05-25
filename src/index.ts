@@ -86,6 +86,7 @@ type MarkdownToken = ReturnType<MarkdownIt["parse"]>[number];
 interface RenderedMarkdownFile {
   html: string;
   hasMermaid: boolean;
+  hasAnnotations: boolean;
   annotations: RenderedAnnotation[];
 }
 
@@ -145,6 +146,18 @@ const MERMAID_INIT_FILE = "mermaid-init.js";
 const MERMAID_ASSET_FILES = [MERMAID_BUNDLE_FILE, MERMAID_INIT_FILE];
 const ANNOTATION_SCRIPT_FILE = "mum-annotate.js";
 const SUPPORTED_ANNOTATION_KINDS: AnnotationKind[] = ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"];
+const SOURCE_POINT_TOKEN_TYPES = new Set([
+  "heading_open",
+  "paragraph_open",
+  "bullet_list_open",
+  "ordered_list_open",
+  "list_item_open",
+  "blockquote_open",
+  "table_open",
+  "hr",
+  "code_block",
+  "fence",
+]);
 const MERMAID_INIT_JS = `(() => {
   if (!globalThis.mermaid) {
     return;
@@ -156,6 +169,92 @@ const MERMAID_INIT_JS = `(() => {
 `;
 
 const ANNOTATION_CSS = `
+
+[data-mum-source-block] {
+  position: relative;
+  scroll-margin-block: var(--mum-space-xl);
+}
+
+[data-mum-source-block].mum-source-active,
+[data-mum-source-block]:target {
+  outline: 2px solid color-mix(in srgb, var(--mum-primary) 72%, transparent);
+  outline-offset: 6px;
+  border-radius: var(--mum-radius-sm);
+  background: color-mix(in srgb, var(--mum-primary) 9%, transparent);
+}
+
+.mum-source-point-cluster {
+  position: absolute;
+  top: -0.1rem;
+  left: calc(100% + var(--mum-space-sm));
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  max-width: 6rem;
+}
+
+.mum-source-point {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 1.85rem;
+  height: 1.85rem;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--mum-primary) 62%, var(--mum-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--mum-primary) 10%, var(--mum-surface));
+  color: var(--mum-primary);
+  text-decoration: none;
+  box-shadow: 0 3px 8px rgb(16 24 40 / 14%);
+  transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.mum-source-point-icon {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+.mum-source-point:hover,
+.mum-source-point:focus-visible,
+.mum-source-point.mum-source-point-active {
+  border-color: var(--mum-primary);
+  background: var(--mum-primary);
+  color: var(--mum-on-primary);
+  box-shadow: 0 6px 14px rgb(16 24 40 / 18%);
+  transform: translateY(-1px);
+}
+
+.mum-source-point:focus-visible,
+.mum-annotation-card:focus-visible,
+.mum-annotation-source-link:focus-visible {
+  outline: 2px solid var(--mum-primary);
+  outline-offset: 2px;
+}
+
+.mum-annotation-card {
+  scroll-margin-block: var(--mum-space-lg);
+}
+
+.mum-annotation-card.mum-annotation-active,
+.mum-annotation-card:target {
+  border-color: var(--mum-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--mum-primary) 18%, transparent);
+}
+
+.mum-annotation-source-link {
+  color: var(--mum-primary);
+  font-size: 0.875rem;
+  font-weight: 700;
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.18em;
+}
 
 .mum-annotation-button {
   position: fixed;
@@ -304,9 +403,275 @@ const ANNOTATION_CSS = `
   outline: 2px solid var(--mum-primary);
   outline-offset: 2px;
 }
+
+@media (max-width: 640px) {
+  .mum-source-point-cluster {
+    position: static;
+    display: inline-flex;
+    gap: 0.3rem;
+    margin-right: var(--mum-space-sm);
+    vertical-align: middle;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mum-source-point {
+    transition: none;
+  }
+
+  .mum-source-point:hover,
+  .mum-source-point:focus-visible,
+  .mum-source-point.mum-source-point-active {
+    transform: none;
+  }
+}
 `;
 
 const ANNOTATION_JS = `(() => {
+  const rail = document.querySelector("[data-mum-annotation-rail]");
+  const annotatableSelector = "[data-mum-source-block][data-mum-source][data-mum-line-start][data-mum-line-end]";
+  const sourcePointSelector = "[data-mum-source-point][data-mum-annotation-id]";
+  let activeAnnotationId = null;
+
+  function closestAnnotatable(node) {
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    return element?.closest(annotatableSelector) ?? null;
+  }
+
+  function annotationIdFromHash() {
+    const hash = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+    for (const prefix of ["mum-annotation-", "mum-source-"]) {
+      if (hash.startsWith(prefix)) {
+        return hash.slice(prefix.length);
+      }
+    }
+    return null;
+  }
+
+  function cardForAnnotation(id) {
+    return document.getElementById("mum-annotation-" + id) ?? rail?.querySelector('[data-mum-annotation-id="' + id + '"]') ?? null;
+  }
+
+  function sourceTargetForAnnotation(id) {
+    const target = document.getElementById("mum-source-" + id);
+    return target?.closest(annotatableSelector) ?? target;
+  }
+
+  function clearActiveAnnotation() {
+    document.querySelectorAll(".mum-source-active").forEach((element) => element.classList.remove("mum-source-active"));
+    document.querySelectorAll(".mum-annotation-active").forEach((element) => element.classList.remove("mum-annotation-active"));
+    document.querySelectorAll(".mum-source-point-active").forEach((element) => element.classList.remove("mum-source-point-active"));
+  }
+
+  function normalizeKind(kind) {
+    return ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"].includes(kind) ? kind : "NOTE";
+  }
+
+  function activateAnnotation(id, target, options = {}) {
+    const source = sourceTargetForAnnotation(id);
+    const card = cardForAnnotation(id);
+    const destination = target === "source" ? source : card;
+
+    clearActiveAnnotation();
+    source?.classList.add("mum-source-active");
+    card?.classList.add("mum-annotation-active");
+    document.querySelectorAll(sourcePointSelector).forEach((point) => {
+      if (point.dataset.mumAnnotationId === id) {
+        point.classList.add("mum-source-point-active");
+      }
+    });
+    activeAnnotationId = id;
+
+    if (destination && options.scroll !== false) {
+      destination.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    if (destination && options.focus !== false && typeof destination.focus === "function") {
+      destination.focus({ preventScroll: true });
+    }
+    if (options.hash !== false) {
+      history.replaceState(null, "", "#" + (target === "source" ? "mum-source-" : "mum-annotation-") + id);
+    }
+  }
+
+  function currentAnnotationIds() {
+    return new Set([...rail?.querySelectorAll("[data-mum-annotation-id]") ?? []].map((card) => card.dataset.mumAnnotationId));
+  }
+
+  function sourceBlockForCard(card) {
+    return [...document.querySelectorAll(annotatableSelector)].find((block) => {
+      return block.dataset.mumSource === card.dataset.mumSource &&
+        block.dataset.mumLineStart === card.dataset.mumLineStart &&
+        block.dataset.mumLineEnd === card.dataset.mumLineEnd;
+    }) ?? null;
+  }
+
+  function truncateLabelDetail(value) {
+    const text = (value ?? "").replace(/\\s+/g, " ").trim();
+    return text.length > 48 ? text.slice(0, 45) + "..." : text;
+  }
+
+  function sourcePointLabel(id, card) {
+    if (!card) {
+      return "View annotation " + id;
+    }
+
+    const kind = normalizeKind(card.dataset.mumKind).toLowerCase();
+    const start = card.dataset.mumLineStart;
+    const end = card.dataset.mumLineEnd;
+    const range = start && end
+      ? start === end
+        ? "line " + start
+        : "lines " + start + "-" + end
+      : "the source";
+    const detail = truncateLabelDetail(card.dataset.mumNote);
+    return "View " + kind + " annotation on " + range + (detail ? ": " + detail : "");
+  }
+
+  function renderSourcePointIcon() {
+    const namespace = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(namespace, "svg");
+    svg.setAttribute("class", "mum-source-point-icon");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+
+    const bubble = document.createElementNS(namespace, "path");
+    bubble.setAttribute("d", "M6 5h12v9H11l-5 4v-4H6z");
+
+    svg.append(bubble);
+    return svg;
+  }
+
+  function renderSourcePoint(id, card) {
+    const link = document.createElement("a");
+    link.className = "mum-source-point";
+    link.href = "#mum-annotation-" + id;
+    link.dataset.mumSourcePoint = "";
+    link.dataset.mumAnnotationId = id;
+    if (card?.dataset.mumKind) {
+      link.dataset.mumKind = normalizeKind(card.dataset.mumKind);
+    }
+    const label = document.createElement("span");
+    label.className = "mum-visually-hidden";
+    label.textContent = sourcePointLabel(id, card);
+    link.append(renderSourcePointIcon(), label);
+    return link;
+  }
+
+  function syncSourcePointsFromRail() {
+    if (!rail) {
+      return;
+    }
+
+    const ids = currentAnnotationIds();
+    document.querySelectorAll(sourcePointSelector).forEach((point) => {
+      if (!ids.has(point.dataset.mumAnnotationId)) {
+        point.remove();
+      }
+    });
+
+    rail.querySelectorAll("[data-mum-annotation-id]").forEach((card) => {
+      const id = card.dataset.mumAnnotationId;
+      if (!id || document.getElementById("mum-source-" + id)) {
+        return;
+      }
+
+      const block = sourceBlockForCard(card);
+      if (!block) {
+        return;
+      }
+
+      if (!block.id) {
+        block.id = "mum-source-" + id;
+      } else {
+        const anchor = document.createElement("span");
+        anchor.id = "mum-source-" + id;
+        anchor.className = "mum-visually-hidden";
+        block.prepend(anchor);
+      }
+      block.dataset.mumAnnotationIds = [block.dataset.mumAnnotationIds, id].filter(Boolean).join(" ");
+
+      let cluster = block.querySelector(":scope > [data-mum-source-point-cluster]");
+      if (!cluster) {
+        cluster = document.createElement("span");
+        cluster.className = "mum-source-point-cluster";
+        cluster.dataset.mumSourcePointCluster = "";
+        cluster.setAttribute("aria-label", "Annotations");
+        block.prepend(cluster);
+      }
+      cluster.append(renderSourcePoint(id, card));
+    });
+  }
+
+  function refreshAnnotationNavigation() {
+    syncSourcePointsFromRail();
+    const hashId = annotationIdFromHash();
+    if (hashId) {
+      activateAnnotation(hashId, window.location.hash.includes("mum-source-") ? "source" : "annotation", {
+        hash: false,
+        scroll: false,
+        focus: false,
+      });
+    } else if (activeAnnotationId && cardForAnnotation(activeAnnotationId)) {
+      activateAnnotation(activeAnnotationId, "annotation", { hash: false, scroll: false, focus: false });
+    } else {
+      clearActiveAnnotation();
+    }
+  }
+
+  function setRailHtml(html) {
+    rail.innerHTML = html;
+    refreshAnnotationNavigation();
+  }
+
+  if (rail) {
+    syncSourcePointsFromRail();
+
+    document.addEventListener("click", (event) => {
+      const sourcePoint = event.target.closest(sourcePointSelector);
+      if (sourcePoint) {
+        event.preventDefault();
+        activateAnnotation(sourcePoint.dataset.mumAnnotationId, "annotation");
+      }
+    });
+
+    rail.addEventListener("click", (event) => {
+      if (event.target.closest("button[data-mum-annotation-action]")) {
+        return;
+      }
+
+      const sourceLink = event.target.closest(".mum-annotation-source-link");
+      if (sourceLink) {
+        const card = sourceLink.closest("[data-mum-annotation-id]");
+        if (card?.dataset.mumAnnotationId) {
+          event.preventDefault();
+          activateAnnotation(card.dataset.mumAnnotationId, "source");
+        }
+        return;
+      }
+
+      if (event.target.closest("a, button, input, select, textarea")) {
+        return;
+      }
+
+      const card = event.target.closest("[data-mum-annotation-id]");
+      if (card?.dataset.mumAnnotationId) {
+        activateAnnotation(card.dataset.mumAnnotationId, "source");
+      }
+    });
+
+    window.addEventListener("hashchange", () => {
+      const id = annotationIdFromHash();
+      if (id) {
+        activateAnnotation(id, window.location.hash.includes("mum-source-") ? "source" : "annotation", {
+          hash: false,
+        });
+      }
+    });
+
+    refreshAnnotationNavigation();
+  }
+
   const addButton = document.querySelector(".mum-annotation-button");
   const dialog = document.querySelector(".mum-annotation-dialog");
   const form = document.querySelector(".mum-annotation-form");
@@ -316,7 +681,6 @@ const ANNOTATION_JS = `(() => {
   const kindInput = document.querySelector(".mum-annotation-kind");
   const noteInput = document.querySelector(".mum-annotation-note");
   const status = document.querySelector(".mum-annotation-status");
-  const rail = document.querySelector("[data-mum-annotation-rail]");
   const submitButton = form?.querySelector('button[type="submit"]');
 
   if (!addButton || !dialog || !form || !cancelButton || !title || !quoteOutput || !kindInput || !noteInput || !status || !rail || !submitButton) {
@@ -326,13 +690,6 @@ const ANNOTATION_JS = `(() => {
   let pendingAnnotation = null;
   let editingAnnotation = null;
   let statusTimer = 0;
-
-  const annotatableSelector = "[data-mum-source][data-mum-line-start][data-mum-line-end]";
-
-  function closestAnnotatable(node) {
-    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    return element?.closest(annotatableSelector) ?? null;
-  }
 
   function setStatus(message) {
     status.textContent = message;
@@ -347,14 +704,6 @@ const ANNOTATION_JS = `(() => {
   function hideButton() {
     addButton.hidden = true;
     pendingAnnotation = null;
-  }
-
-  function normalizeKind(kind) {
-    return ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"].includes(kind) ? kind : "NOTE";
-  }
-
-  function setRailHtml(html) {
-    rail.innerHTML = html;
   }
 
   function openDialog(mode, annotation) {
@@ -760,10 +1109,8 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
   }
 
   await mkdir(outputDir, { recursive: true });
-  const stylesheetPath = await writeStylesheet(outputDir, design);
-  result.generated.push(relativePath(cwd, stylesheetPath));
 
-  const renderedFiles: Array<{ outputName: string; html: string; hasMermaid: boolean }> = [];
+  const renderedFiles: Array<{ outputName: string; html: string; hasMermaid: boolean; hasAnnotations: boolean }> = [];
 
   for (const input of inputs) {
     const inputPath = path.join(cwd, input);
@@ -772,6 +1119,10 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
     const rendered = await renderMarkdownFile(markdown, inputPath, input, outputName, result.warnings);
     renderedFiles.push({ outputName, ...rendered });
   }
+
+  const hasRenderedAnnotations = renderedFiles.some((rendered) => rendered.hasAnnotations);
+  const stylesheetPath = await writeStylesheet(outputDir, design, hasRenderedAnnotations);
+  result.generated.push(relativePath(cwd, stylesheetPath));
 
   if (!hasExplicitInputs) {
     await removeStaleHtml(outputDir, inputs.map((input) => outputFileName(input)));
@@ -782,6 +1133,13 @@ export async function renderProject(options: RenderOptions = {}): Promise<Comman
     result.generated.push(...mermaidAssets.map((assetPath) => relativePath(cwd, assetPath)));
   } else {
     await removeMermaidAssets(outputDir);
+  }
+
+  if (hasRenderedAnnotations) {
+    const annotationScriptPath = await writeAnnotationAsset(outputDir);
+    result.generated.push(relativePath(cwd, annotationScriptPath));
+  } else {
+    await removeAnnotationAsset(outputDir);
   }
 
   for (const { outputName, html } of renderedFiles) {
@@ -1444,6 +1802,7 @@ function extractManagedAnnotations(markdown: string, source: string): { markdown
       quote: block.quote,
       note: block.note,
     });
+    outputLines.push(...Array.from({ length: end - index + 1 }, () => ""));
     index = end;
   }
 
@@ -1754,8 +2113,13 @@ async function renderMarkdownFile(
   warnings: string[],
   options: { annotationSource?: string } = {},
 ): Promise<RenderedMarkdownFile> {
-  const md = createMarkdownIt(options);
   const extracted = extractManagedAnnotations(markdown, inputName);
+  const hasAnnotations = extracted.annotations.length > 0;
+  const annotationSource = options.annotationSource ?? (hasAnnotations ? inputName : undefined);
+  const md = createMarkdownIt({
+    annotationSource,
+    sourceAnnotations: extracted.annotations,
+  });
   const tokens = md.parse(extracted.markdown, {});
   const hasMermaid = hasMermaidDiagram(tokens);
   await embedLocalImages(tokens, path.dirname(inputPath), inputName, warnings);
@@ -1765,14 +2129,14 @@ async function renderMarkdownFile(
     title,
     body,
     stylesheetHrefForOutput(outputName),
-    scriptHrefsForOutput(outputName, hasMermaid, Boolean(options.annotationSource)),
+    scriptHrefsForOutput(outputName, hasMermaid, Boolean(options.annotationSource) || hasAnnotations),
     Boolean(options.annotationSource),
     extracted.annotations,
   );
-  return { html, hasMermaid, annotations: extracted.annotations };
+  return { html, hasMermaid, hasAnnotations, annotations: extracted.annotations };
 }
 
-function createMarkdownIt(options: { annotationSource?: string } = {}): MarkdownIt {
+function createMarkdownIt(options: { annotationSource?: string; sourceAnnotations?: RenderedAnnotation[] } = {}): MarkdownIt {
   const md = new MarkdownIt({
     html: false,
     linkify: true,
@@ -1780,39 +2144,47 @@ function createMarkdownIt(options: { annotationSource?: string } = {}): Markdown
   }).use(markdownItTaskLists);
 
   const annotationSource = options.annotationSource;
+  const sourceAnnotations = options.sourceAnnotations ?? [];
+  const renderedSourceAnnotationIds = new Set<string>();
 
   addClassRule(md, "heading_open", (token) => {
     const level = token.tag.replace(/^h/i, "");
     return `mum-heading mum-h${level}`;
-  }, annotationSource);
-  addClassRule(md, "paragraph_open", "mum-paragraph", annotationSource);
+  }, annotationSource, sourceAnnotations, renderedSourceAnnotationIds);
+  addClassRule(md, "paragraph_open", "mum-paragraph", annotationSource, sourceAnnotations, renderedSourceAnnotationIds);
   addClassRule(md, "link_open", "mum-link");
   addClassRule(
     md,
     "bullet_list_open",
     (token) => (hasClass(token, "contains-task-list") ? "mum-list mum-ul mum-task-list" : "mum-list mum-ul"),
     annotationSource,
+    sourceAnnotations,
+    renderedSourceAnnotationIds,
   );
   addClassRule(
     md,
     "ordered_list_open",
     (token) => (hasClass(token, "contains-task-list") ? "mum-list mum-ol mum-task-list" : "mum-list mum-ol"),
     annotationSource,
+    sourceAnnotations,
+    renderedSourceAnnotationIds,
   );
   addClassRule(
     md,
     "list_item_open",
     (token) => (hasClass(token, "task-list-item") ? "mum-list-item mum-task-list-item" : "mum-list-item"),
     annotationSource,
+    sourceAnnotations,
+    renderedSourceAnnotationIds,
   );
-  addClassRule(md, "blockquote_open", "mum-blockquote", annotationSource);
-  addClassRule(md, "table_open", "mum-table", annotationSource);
+  addClassRule(md, "blockquote_open", "mum-blockquote", annotationSource, sourceAnnotations, renderedSourceAnnotationIds);
+  addClassRule(md, "table_open", "mum-table", annotationSource, sourceAnnotations, renderedSourceAnnotationIds);
   addClassRule(md, "thead_open", "mum-table-head");
   addClassRule(md, "tbody_open", "mum-table-body");
   addClassRule(md, "tr_open", "mum-table-row");
   addClassRule(md, "th_open", "mum-table-cell mum-table-header");
   addClassRule(md, "td_open", "mum-table-cell");
-  addClassRule(md, "hr", "mum-hr", annotationSource);
+  addClassRule(md, "hr", "mum-hr", annotationSource, sourceAnnotations, renderedSourceAnnotationIds);
   addClassRule(md, "s_open", "mum-strikethrough");
 
   md.renderer.rules.image = (tokens, idx, options, env, renderer) => {
@@ -1830,18 +2202,21 @@ function createMarkdownIt(options: { annotationSource?: string } = {}): Markdown
   };
 
   md.renderer.rules.code_block = (tokens, idx) => {
-    return `<pre class="mum-code-block"${annotationDataAttrs(tokens[idx], annotationSource)}><code class="mum-code mum-code-block-code">${escapeHtml(tokens[idx].content)}</code></pre>\n`;
+    const token = tokens[idx];
+    const annotations = sourceAnnotationsForToken(token, sourceAnnotations, renderedSourceAnnotationIds);
+    return `<pre class="mum-code-block"${annotationDataAttrs(token, annotationSource, annotations)}>${renderSourcePointCluster(annotations)}<code class="mum-code mum-code-block-code">${escapeHtml(token.content)}</code></pre>\n`;
   };
 
   md.renderer.rules.fence = (tokens, idx) => {
     const token = tokens[idx];
     const langName = token.info.trim().split(/\s+/)[0] ?? "";
+    const annotations = sourceAnnotationsForToken(token, sourceAnnotations, renderedSourceAnnotationIds);
     if (isMermaidFenceInfo(token.info)) {
-      return `<pre class="mum-mermaid mermaid"${annotationDataAttrs(token, annotationSource)}>${escapeHtml(token.content)}</pre>\n`;
+      return `<pre class="mum-mermaid mermaid"${annotationDataAttrs(token, annotationSource, annotations)}>${renderSourcePointCluster(annotations)}${escapeHtml(token.content)}</pre>\n`;
     }
 
     const languageClass = langName ? ` language-${escapeHtmlAttribute(langName)}` : "";
-    return `<pre class="mum-code-block"${annotationDataAttrs(token, annotationSource)}><code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
+    return `<pre class="mum-code-block"${annotationDataAttrs(token, annotationSource, annotations)}>${renderSourcePointCluster(annotations)}<code class="mum-code mum-code-block-code${languageClass}">${escapeHtml(token.content)}</code></pre>\n`;
   };
 
   md.renderer.rules.html_inline = (tokens, idx) => {
@@ -2017,8 +2392,8 @@ function renderAnnotationCard(annotation: RenderedAnnotation, editable: boolean)
 </div>`
     : "";
 
-  return `<li class="mum-annotation-card" data-mum-annotation-id="${escapeHtmlAttribute(annotation.id)}" data-mum-source="${escapeHtmlAttribute(annotation.source)}" data-mum-kind="${annotation.kind}" data-mum-quote="${escapeHtmlAttribute(annotation.quote)}" data-mum-note="${escapeHtmlAttribute(annotation.note)}">
-<p class="mum-annotation-card-meta"><span class="mum-annotation-kind-badge">${annotation.kind}</span><span>${escapeHtml(range)}</span></p>
+  return `<li class="mum-annotation-card" id="mum-annotation-${escapeHtmlAttribute(annotation.id)}" tabindex="-1" data-mum-annotation-id="${escapeHtmlAttribute(annotation.id)}" data-mum-source="${escapeHtmlAttribute(annotation.source)}" data-mum-kind="${annotation.kind}" data-mum-quote="${escapeHtmlAttribute(annotation.quote)}" data-mum-note="${escapeHtmlAttribute(annotation.note)}" data-mum-line-start="${annotation.blockStartLine}" data-mum-line-end="${annotation.blockEndLine}">
+<p class="mum-annotation-card-meta"><span class="mum-annotation-kind-badge">${annotation.kind}</span><span>${escapeHtml(range)}</span><a class="mum-annotation-source-link" href="#mum-source-${escapeHtmlAttribute(annotation.id)}">View source<span class="mum-visually-hidden"> for annotation ${escapeHtml(annotation.id)}</span></a></p>
 <blockquote class="mum-annotation-card-quote">${escapeHtml(annotation.quote)}</blockquote>
 <p class="mum-annotation-card-note">${escapeHtml(annotation.note).replaceAll("\n", "<br>")}</p>
 ${actions}
@@ -2029,9 +2404,9 @@ function railHtmlForSource(site: AnnotationSite, source: string): string {
   return renderAnnotationRailContents(site.annotationsBySource.get(source) ?? [], true);
 }
 
-async function writeStylesheet(outputDir: string, design: DesignTokens): Promise<string> {
+async function writeStylesheet(outputDir: string, design: DesignTokens, includeAnnotationCss = false): Promise<string> {
   const stylesheetPath = path.join(outputDir, "style.css");
-  await writeFile(stylesheetPath, renderCss(design), "utf8");
+  await writeFile(stylesheetPath, renderCss(design) + (includeAnnotationCss ? ANNOTATION_CSS : ""), "utf8");
   return stylesheetPath;
 }
 
@@ -2054,6 +2429,19 @@ async function removeMermaidAssets(outputDir: string): Promise<void> {
       }
     }),
   );
+}
+
+async function writeAnnotationAsset(outputDir: string): Promise<string> {
+  const scriptPath = path.join(outputDir, ANNOTATION_SCRIPT_FILE);
+  await writeFile(scriptPath, ANNOTATION_JS, "utf8");
+  return scriptPath;
+}
+
+async function removeAnnotationAsset(outputDir: string): Promise<void> {
+  const scriptPath = path.join(outputDir, ANNOTATION_SCRIPT_FILE);
+  if (await pathExists(scriptPath)) {
+    await unlink(scriptPath);
+  }
 }
 
 async function writeDocumentationIndex(outputDir: string): Promise<string> {
@@ -2560,15 +2948,19 @@ function addClassRule(
   tokenType: string,
   className: string | ((token: MarkdownToken) => string),
   annotationSource?: string,
+  sourceAnnotations: RenderedAnnotation[] = [],
+  renderedSourceAnnotationIds: Set<string> = new Set(),
 ): void {
   const defaultRender =
     md.renderer.rules[tokenType] ??
     ((tokens, idx, options, _env, renderer) => renderer.renderToken(tokens, idx, options));
 
   md.renderer.rules[tokenType] = (tokens, idx, options, env, renderer) => {
-    addClass(tokens[idx], typeof className === "function" ? className(tokens[idx]) : className);
-    addAnnotationDataAttrs(tokens[idx], annotationSource);
-    return defaultRender(tokens, idx, options, env, renderer);
+    const token = tokens[idx];
+    const annotations = sourceAnnotationsForToken(token, sourceAnnotations, renderedSourceAnnotationIds);
+    addClass(token, typeof className === "function" ? className(token) : className);
+    addAnnotationDataAttrs(token, annotationSource, annotations);
+    return defaultRender(tokens, idx, options, env, renderer) + renderSourcePointCluster(annotations);
   };
 }
 
@@ -2576,26 +2968,106 @@ function addClass(token: MarkdownToken, className: string): void {
   token.attrJoin("class", className);
 }
 
-function addAnnotationDataAttrs(token: MarkdownToken, annotationSource: string | undefined): void {
+function sourceAnnotationsForToken(
+  token: MarkdownToken,
+  annotations: RenderedAnnotation[],
+  renderedSourceAnnotationIds: Set<string>,
+): RenderedAnnotation[] {
+  if (!token.map || !SOURCE_POINT_TOKEN_TYPES.has(token.type)) {
+    return [];
+  }
+
+  const startLine = token.map[0] + 1;
+  const endLine = token.map[1];
+  const matches = annotations.filter((annotation) => {
+    return !renderedSourceAnnotationIds.has(annotation.id) &&
+      annotation.blockStartLine === startLine &&
+      annotation.blockEndLine === endLine;
+  });
+
+  for (const annotation of matches) {
+    renderedSourceAnnotationIds.add(annotation.id);
+  }
+
+  return matches;
+}
+
+function addAnnotationDataAttrs(
+  token: MarkdownToken,
+  annotationSource: string | undefined,
+  annotations: RenderedAnnotation[] = [],
+): void {
   if (!annotationSource || !token.map) {
     return;
   }
 
+  if (annotations.length > 0) {
+    token.attrSet("id", `mum-source-${annotations[0]?.id}`);
+    token.attrSet("tabindex", "-1");
+    token.attrSet("data-mum-annotation-ids", annotations.map((annotation) => annotation.id).join(" "));
+  }
+  token.attrSet("data-mum-source-block", "");
   token.attrSet("data-mum-source", annotationSource);
   token.attrSet("data-mum-line-start", String(token.map[0] + 1));
   token.attrSet("data-mum-line-end", String(token.map[1]));
 }
 
-function annotationDataAttrs(token: MarkdownToken, annotationSource: string | undefined): string {
+function annotationDataAttrs(
+  token: MarkdownToken,
+  annotationSource: string | undefined,
+  annotations: RenderedAnnotation[] = [],
+): string {
   if (!annotationSource || !token.map) {
     return "";
   }
 
   return [
+    ...(annotations.length > 0
+      ? [
+        ` id="mum-source-${escapeHtmlAttribute(annotations[0]?.id ?? "")}"`,
+        ` tabindex="-1"`,
+        ` data-mum-annotation-ids="${escapeHtmlAttribute(annotations.map((annotation) => annotation.id).join(" "))}"`,
+      ]
+      : []),
+    ` data-mum-source-block`,
     ` data-mum-source="${escapeHtmlAttribute(annotationSource)}"`,
     ` data-mum-line-start="${token.map[0] + 1}"`,
     ` data-mum-line-end="${token.map[1]}"`,
   ].join("");
+}
+
+function renderSourcePointCluster(annotations: RenderedAnnotation[]): string {
+  if (annotations.length === 0) {
+    return "";
+  }
+
+  const points = annotations
+    .map((annotation, index) => {
+      const extraAnchor = index === 0
+        ? ""
+        : `<span class="mum-visually-hidden" id="mum-source-${escapeHtmlAttribute(annotation.id)}"></span>`;
+      return `${extraAnchor}<a class="mum-source-point" href="#mum-annotation-${escapeHtmlAttribute(annotation.id)}" data-mum-source-point data-mum-annotation-id="${escapeHtmlAttribute(annotation.id)}" data-mum-kind="${annotation.kind}">${sourcePointIconSvg()}<span class="mum-visually-hidden">${escapeHtml(sourcePointLabel(annotation))}</span></a>`;
+    })
+    .join("");
+
+  return `<span class="mum-source-point-cluster" data-mum-source-point-cluster aria-label="Annotations">${points}</span>`;
+}
+
+function sourcePointIconSvg(): string {
+  return `<svg class="mum-source-point-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 5h12v9H11l-5 4v-4H6z"></path></svg>`;
+}
+
+function sourcePointLabel(annotation: RenderedAnnotation): string {
+  const range = annotation.blockStartLine === annotation.blockEndLine
+    ? `line ${annotation.blockStartLine}`
+    : `lines ${annotation.blockStartLine}-${annotation.blockEndLine}`;
+  const detail = truncateLabelDetail(annotation.note);
+  return `View ${annotation.kind.toLowerCase()} annotation on ${range}${detail ? `: ${detail}` : ""}`;
+}
+
+function truncateLabelDetail(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > 48 ? `${text.slice(0, 45)}...` : text;
 }
 
 function hasClass(token: MarkdownToken, className: string): boolean {

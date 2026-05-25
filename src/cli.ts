@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { spawn } from "node:child_process";
 import { initProject, renderProject, startAnnotationServer, syncAnnotations, type CommandResult } from "./index.js";
 
 const program = new Command();
@@ -28,10 +29,14 @@ program
   .description("Start a local browser annotation server for Markdown files.")
   .option("--port <number>", "Local server port. Use 0 to choose an available port.", parsePort, 0)
   .option("--host <host>", "Local server host.", "127.0.0.1")
-  .action(async (files: string[], options: { port: number; host: string }) => {
+  .option("--no-open", "Do not open the annotation URL in the default browser.")
+  .action(async (files: string[], options: { port: number; host: string; open: boolean }) => {
     try {
       const server = await startAnnotationServer({ inputs: files, port: options.port, host: options.host });
       console.log(`annotation server ${server.url}`);
+      if (options.open) {
+        openBrowser(server.url);
+      }
       process.once("SIGINT", () => {
         server.close().finally(() => {
           process.exitCode = 0;
@@ -102,4 +107,34 @@ function parsePort(value: string): number {
   }
 
   return port;
+}
+
+function openBrowser(url: string): void {
+  const command = browserOpenCommand(url);
+
+  try {
+    const child = spawn(command.file, command.args, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.once("error", (error) => {
+      console.warn(`warning could not open annotation server in browser: ${error.message}`);
+    });
+    child.unref();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`warning could not open annotation server in browser: ${message}`);
+  }
+}
+
+function browserOpenCommand(url: string): { file: string; args: string[] } {
+  if (process.platform === "darwin") {
+    return { file: "open", args: [url] };
+  }
+
+  if (process.platform === "win32") {
+    return { file: process.env.ComSpec ?? "cmd", args: ["/c", "start", "", url] };
+  }
+
+  return { file: "xdg-open", args: [url] };
 }

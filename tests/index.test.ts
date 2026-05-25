@@ -293,7 +293,11 @@ describe("startAnnotationServer", () => {
       expect(html).toContain('data-mum-annotation-rail');
       expect(html).toContain("No annotations yet.");
       expect(css).toContain(".mum-annotation-button");
+      expect(css).toContain(".mum-source-point");
+      expect(css).toContain(".mum-source-active");
       expect(css).toContain(".mum-annotation-card-actions");
+      expect(script).toContain("activateAnnotation");
+      expect(script).toContain("sourcePointSelector");
       expect(script).toContain('method: editingAnnotation ? "PATCH" : "POST"');
     } finally {
       await server.close();
@@ -340,8 +344,13 @@ describe("startAnnotationServer", () => {
       expect(markdown).toContain("> Browser note");
       expect(payload.railHtml).toContain("Browser note");
       expect(payload.railHtml).toContain("WARNING");
+      expect(payload.railHtml).toContain(`id="mum-annotation-${payload.annotation.id}"`);
+      expect(payload.railHtml).toContain(`href="#mum-source-${payload.annotation.id}"`);
       expect(refreshedHtml).toContain("Browser note");
       expect(refreshedHtml).toContain("mum-annotation-card");
+      expect(refreshedHtml).toContain(`id="mum-source-${payload.annotation.id}"`);
+      expect(refreshedHtml).toContain(`href="#mum-annotation-${payload.annotation.id}"`);
+      expect(refreshedHtml).toContain(`id="mum-annotation-${payload.annotation.id}"`);
       expect(refreshedHtml).not.toContain("mum-annotation:start");
       expect(refreshedHtml).not.toContain("mum-annotation:end");
     } finally {
@@ -438,19 +447,71 @@ Tail.
       "utf8",
     );
 
-    await renderProject({ cwd, inputs: ["README.md"] });
+    const result = await renderProject({ cwd, inputs: ["README.md"] });
     const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+    const css = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "style.css"), "utf8");
+    const script = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mum-annotate.js"), "utf8");
 
+    expect(result.generated).toContain(".make-up-markdown/mum-annotate.js");
+    expect(html).toContain('<script defer src="mum-annotate.js"></script>');
     expect(html).toContain('data-mum-annotation-rail');
     expect(html).toContain("mum-annotation-card");
+    expect(html).toContain('id="mum-source-anno-1"');
+    expect(html).toContain('id="mum-annotation-anno-1"');
+    expect(html).toContain('data-mum-annotation-id="anno-1"');
+    expect(html).toContain('data-mum-line-start="3"');
+    expect(html).toContain('data-mum-line-end="3"');
+    expect(html).toContain('class="mum-source-point" href="#mum-annotation-anno-1"');
+    expect(html).toContain('<svg class="mum-source-point-icon"');
+    expect(html).toContain("View caution annotation on line 3: Static note");
+    expect(html).toContain('href="#mum-source-anno-1"');
+    expect(html).toContain("View source");
     expect(html).toContain("CAUTION");
     expect(html).toContain("Static note");
     expect(html).toContain("Line 3");
+    expect(css).toContain(".mum-source-point");
+    expect(css).toContain("left: calc(100% + var(--mum-space-sm));");
+    expect(css).toContain(".mum-source-active");
+    expect(css).toContain(".mum-annotation-active");
+    expect(script).toContain("activateAnnotation");
     expect(html).not.toContain("mum-annotation-card-actions");
     expect(html).not.toContain("Edit annotation");
     expect(html).not.toContain("Delete annotation");
     expect(html).not.toContain("mum-annotation:start");
     expect(html).not.toContain("[!CAUTION]");
+  });
+
+  it("renders multiple source points for annotations on the same Markdown block", async () => {
+    const cwd = await tempProject();
+    await writeFile(path.join(cwd, DEFAULT_DESIGN_FILE), STARTER_DESIGN_MD, "utf8");
+    await writeFile(
+      path.join(cwd, "README.md"),
+      `# Project
+
+Paragraph one.
+<!-- mum-annotation:start id="anno-1" kind="NOTE" block-start="3" block-end="3" -->
+> [!NOTE]
+> Annotation on: "Paragraph one."
+> First note
+<!-- mum-annotation:end -->
+<!-- mum-annotation:start id="anno-2" kind="TIP" block-start="3" block-end="3" -->
+> [!TIP]
+> Annotation on: "Paragraph one."
+> Second note
+<!-- mum-annotation:end -->
+`,
+      "utf8",
+    );
+
+    await renderProject({ cwd, inputs: ["README.md"] });
+    const html = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "README.html"), "utf8");
+
+    expect(html.match(/class="mum-source-point"/g)).toHaveLength(2);
+    expect(html.match(/class="mum-source-point-icon"/g)).toHaveLength(2);
+    expect(html).toContain('id="mum-source-anno-1"');
+    expect(html).toContain('id="mum-source-anno-2"');
+    expect(html).toContain('href="#mum-annotation-anno-1"');
+    expect(html).toContain('href="#mum-annotation-anno-2"');
   });
 
   it("renders visible Markdown files recursively by default without modifying them and refreshes stale output", async () => {
@@ -466,6 +527,7 @@ Tail.
     );
     await mkdir(path.join(cwd, DEFAULT_OUTPUT_DIR));
     await writeFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "stale.html"), "stale", "utf8");
+    await writeFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mum-annotate.js"), "stale", "utf8");
     const before = await readFile(path.join(cwd, "README.md"), "utf8");
 
     const first = await renderProject({ cwd });
@@ -513,6 +575,7 @@ Tail.
       "index.html",
       "style.css",
     ]);
+    await expect(readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "mum-annotate.js"), "utf8")).rejects.toThrow();
     const stylesheet = await readFile(path.join(cwd, DEFAULT_OUTPUT_DIR, "style.css"), "utf8");
     expect(stylesheet).toContain("color-scheme: light dark;");
     expect(stylesheet).toContain("--mum-background-light: #F8FAFC;");

@@ -32,7 +32,7 @@ mum render README.md docs/guide.md
 
 Generated HTML includes inline CSS, preserves Markdown links and remote image URLs, and embeds supported local images as data URLs. Rendering is local and does not fetch remote resources.
 
-`annotate` starts a local browser annotation server and prints its URL. It uses the same Markdown discovery and explicit file handling as `render`; pass files to limit the session, and use `--port <number>` when you need a specific local port.
+`annotate` starts a local browser annotation server, opens its URL in your default browser, and prints the URL. It uses the same Markdown discovery and explicit file handling as `render`; pass files to limit the session, use `--port <number>` when you need a specific local port, or add `--no-open` to keep the browser closed.
 
 ```sh
 mum annotate README.md docs/guide.md --port 5173
